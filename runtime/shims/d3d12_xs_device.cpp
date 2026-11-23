@@ -116,6 +116,32 @@ bool trace_enabled() {
     return enabled;
 }
 
+// XS_TRACE=2 turns on log_forwarded_args below. XS_TRACE=1 is the existing per-slot first-call line.
+bool forwarded_args_enabled() {
+    static const bool enabled = [] {
+        char value[8] = {};
+        const DWORD length = GetEnvironmentVariableA("XS_TRACE", value, sizeof(value));
+        return length > 0 && value[0] == '2';
+    }();
+    return enabled;
+}
+
+const char* slot_name(unsigned slot);
+// XS_TRACE=2 adds the raw 64-bit arguments of every forwarded device slot. A console call shape that differs
+// from the PC one faults inside the PC runtime, with this proxy on the stack; the arguments it was handed are
+// the whole diagnosis (docs/retail_boot_chain.md stop 7 calls device slot 26, and the PC runtime faults inside
+// it). Only the values are printed, as addresses: nothing is dereferenced.
+void log_forwarded_args(unsigned slot, const std::uint64_t* words, unsigned count) {
+    std::fprintf(stderr, "[rt] d3d12_xs: device slot %u (%s) forwarded args:", slot, slot_name(slot));
+    for (unsigned i = 0; i < 14; ++i) {
+        if (i < count)
+            std::fprintf(stderr, " a%u=0x%llx", i + 1, static_cast<unsigned long long>(words[i]));
+        else
+            std::fprintf(stderr, " a%u=-", i + 1);
+    }
+    std::fprintf(stderr, "\n");
+}
+
 const char* slot_name(unsigned slot) {
     switch (slot) {
         case 0: return "QueryInterface";
@@ -1212,7 +1238,22 @@ HRESULT proxy_create_command_list_x(DeviceProxy* self, std::uint64_t desc_word, 
     auto* allocator = allocator_proxy_real_allocator(reinterpret_cast<void*>(allocator_word));
     if (!allocator) allocator = reinterpret_cast<ID3D12CommandAllocator*>(allocator_word);
     auto* initial_state = reinterpret_cast<ID3D12PipelineState*>(initial_state_word);
-    return self->real->CreateCommandList(0, type, allocator, initial_state, *riid, out);
+    // The title passes a CONSOLE command-list IID that the PC SDK does not declare (docs/retail_boot_chain.md
+    // section 3.3), so the PC call returns E_NOINTERFACE with nothing in `out`, and the title dereferences that null.
+    // Try the IID first; when the PC runtime refuses it, create the nearest PC list and answer the request with the
+    // PC identity the object really has. A caller that asked by number is no worse off, and the title gets a usable
+    // list; a full console list proxy (docs/d3d12_command_objects.md section 3.5a) is still the real fix.
+    HRESULT hr = self->real->CreateCommandList(0, type, allocator, initial_state, *riid, out);
+    if (hr == E_NOINTERFACE && out && !*out) {
+        static std::atomic<bool> logged_fallback{false};
+        if (first_call(logged_fallback))
+            std::fprintf(stderr,
+                         "[rt] d3d12_xs: slot 73: the PC runtime refused the requested command-list IID; "
+                         "creating ID3D12GraphicsCommandList and answering with its PC identity\n");
+        hr = self->real->CreateCommandList(0, type, allocator, initial_state,
+                                           __uuidof(ID3D12GraphicsCommandList), out);
+    }
+    return hr;
 }
 
 // Device slot 75: ID3D12Device9::CreateCommandQueue1(desc, creator_id, riid, out), called by slot index.
@@ -1548,8 +1589,30 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
             return hr_to_u64(proxy_wait_frame_event_x(self, a1, a2, a4, a5));
         }
         if (Slot == routes.queue_x) {
-            log_xbox_route_once(Slot, "CreateCommandQueueX", a1, a2, a3, a4, a5);
-            return hr_to_u64(proxy_create_command_queue(self, reinterpret_cast<const D3D12_COMMAND_QUEUE_DESC*>(a1),
+            log_xbox_route_once(Slot, "CreateCommandQueueX (PC desc from the 16-byte prefix, Flags masked)", a1, a2,
+                                a3, a4, a5);
+            // The console description is a PC D3D12_COMMAND_QUEUE_DESC (Type, Priority, Flags, NodeMask) followed by
+            // Xbox words (docs/retail_boot_chain.md section 3.2). Only the 16-byte PC prefix describes a PC queue:
+            // copy it out so no Xbox word past it is read, and limit Flags to the one flag the PC runtime accepts,
+            // D3D12_COMMAND_QUEUE_FLAG_DISABLE_GPU_TIMEOUT; the other console bits describe the Xbox host queue and
+            // are not part of the PC description. A null description reaches the PC method as null, for its own
+            // E_INVALIDARG.
+            D3D12_COMMAND_QUEUE_DESC pc_desc{};
+            std::uint32_t console_flags = 0;
+            if (a1) {
+                std::memcpy(&pc_desc, reinterpret_cast<const void*>(a1), sizeof(pc_desc));
+                console_flags = static_cast<std::uint32_t>(pc_desc.Flags);
+            }
+            pc_desc.Flags = static_cast<D3D12_COMMAND_QUEUE_FLAGS>(
+                console_flags & static_cast<std::uint32_t>(D3D12_COMMAND_QUEUE_FLAG_DISABLE_GPU_TIMEOUT));
+            static std::atomic<bool> desc_logged{false};
+            if (a1 && first_call(desc_logged))
+                std::fprintf(stderr,
+                             "[rt] d3d12_xs: device slot %u CreateCommandQueueX: PC desc from the console 16-byte "
+                             "prefix (type %d, priority %d, flags 0x%x -> 0x%x, node mask %u)\n",
+                             routes.queue_x, static_cast<int>(pc_desc.Type), static_cast<int>(pc_desc.Priority),
+                             console_flags, static_cast<std::uint32_t>(pc_desc.Flags), pc_desc.NodeMask);
+            return hr_to_u64(proxy_create_command_queue(self, a1 ? &pc_desc : nullptr,
                                                         reinterpret_cast<const IID*>(a2),
                                                         reinterpret_cast<void**>(a3)));
         }
@@ -1557,6 +1620,26 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
             log_xbox_route_once(Slot, "CreateCommandListX", a1, a2, a3, a4, a5);
             return hr_to_u64(proxy_create_command_list_x(self, a1, a2, a3, reinterpret_cast<const IID*>(a4),
                                                          reinterpret_cast<void**>(a5)));
+        }
+        if constexpr (Slot == 26) {
+            // The console form has the device in RDX (this thunk's a1) and the return buffer in RCX (self); a PC
+            // C++ caller has the proxy in RCX and its buffer in RDX, and goes to the forwarder below.
+            if (trace_enabled()) {
+                const auto* probe = static_cast<const std::uint64_t*>(reinterpret_cast<const void*>(a1));
+                std::fprintf(stderr, "[rt] d3d12_xs: slot 26 probe: self=%p a1=%p first_word(a1)=%p is_proxy=%d\n",
+                             static_cast<const void*>(self), reinterpret_cast<const void*>(a1),
+                             reinterpret_cast<const void*>(probe ? probe[0] : 0),
+                             is_device_proxy(reinterpret_cast<const void*>(a1)) ? 1 : 0);
+            }
+            if (is_device_proxy(reinterpret_cast<const void*>(a1))) {
+                auto* device = reinterpret_cast<DeviceProxy*>(a1);
+                D3D12_HEAP_PROPERTIES properties = device->real->GetCustomHeapProperties(
+                    static_cast<UINT>(a2), static_cast<D3D12_HEAP_TYPE>(static_cast<std::uint32_t>(a3)));
+                std::memcpy(reinterpret_cast<void*>(self), &properties, sizeof(properties));
+                if (trace_enabled())
+                    std::fprintf(stderr, "[rt] d3d12_xs: device slot 26 (GetCustomHeapProperties): console order\n");
+                return reinterpret_cast<std::uint64_t>(self);
+            }
         }
         if (Slot >= self->slot_count) return hr_to_u64(refuse_beyond_device(Slot, self->slot_count));
 
@@ -1566,6 +1649,12 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
                                                  std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t,
                                                  std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t,
                                                  std::uint64_t, std::uint64_t, std::uint64_t);
+        // The forwarded call is where a console call shape that differs from the PC one faults, inside the PC
+        // runtime and with this proxy on the stack. Record what it was handed before the call (XS_TRACE=2).
+        if (forwarded_args_enabled()) {
+            const std::uint64_t words[14] = {a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14};
+            log_forwarded_args(Slot, words, 14);
+        }
         auto fn = reinterpret_cast<ForwardFn>(self->real_vtable[Slot]);
         return fn(self->real, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14);
     }

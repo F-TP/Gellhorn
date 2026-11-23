@@ -91,6 +91,10 @@ struct Mock {
     unsigned calls[kMockSlots];
     std::uint64_t args[kMockSlots][5];
     std::uint64_t array[kMockSlots][4];  // device: the first entries of the array argument, as received
+    // device slot 8: the description the last CreateCommandQueue was handed, copied during the call. The proxy builds
+    // one on its own stack for the Xbox slot 48, so the pointer is only valid while the call runs.
+    D3D12_COMMAND_QUEUE_DESC queue_desc;
+    std::uint64_t queue_desc_pointer;  // the pointer the real method was handed, to tell a copy from the caller's
 };
 
 Mock g_pool[256];
@@ -186,7 +190,11 @@ std::uint64_t mock_call(Mock* m, unsigned slot, const std::uint64_t* words) {
     const std::uint64_t a1 = words[0], a2 = words[1], a3 = words[2], a4 = words[3];
     if (m->kind == Kind::device) {
         switch (slot) {
-            case 8: return static_cast<std::uint32_t>(mock_create(m, Kind::queue, a2, a3));    // CreateCommandQueue
+            case 8: {  // CreateCommandQueue: record the description, the way the PC method would read it
+                m->queue_desc_pointer = a1;
+                if (a1) std::memcpy(&m->queue_desc, reinterpret_cast<const void*>(a1), sizeof(m->queue_desc));
+                return static_cast<std::uint32_t>(mock_create(m, Kind::queue, a2, a3));
+            }
             case 9: return static_cast<std::uint32_t>(mock_create(m, Kind::allocator, a2, a3));  // CreateCmdAllocator
             case 75: return static_cast<std::uint32_t>(mock_create(m, Kind::queue, a3, a4));   // CreateCommandQueue1
             case 36: return static_cast<std::uint32_t>(mock_create(m, Kind::fence, a3, a4));   // CreateFence
@@ -714,11 +722,42 @@ int check_xbox_slots() {
     EXPECT(hr_of(raw(device, 80, 0, 0, 0, 0, 0)) == E_POINTER);
     EXPECT(mock->calls[80] == 0 && xs::device_slot_hits(80) == 3);
 
-    // 48 CreateCommandQueueX(desc, riid, out): the queue proxy, created through the PC slot 8 path.
+    // 48 CreateCommandQueueX(desc, riid, out): the queue proxy, created through the PC slot 8 path. The proxy copies
+    // the console desc's 16-byte PC prefix and masks Flags to D3D12_COMMAND_QUEUE_FLAG_DISABLE_GPU_TIMEOUT; the mock
+    // records what the real CreateCommandQueue was handed (the proxy's copy is only valid during the call).
+    D3D12_COMMAND_QUEUE_DESC pc_queue{};
+    pc_queue.Type = D3D12_COMMAND_LIST_TYPE_COMPUTE;
+    pc_queue.Priority = D3D12_COMMAND_QUEUE_PRIORITY_HIGH;
+    pc_queue.Flags = D3D12_COMMAND_QUEUE_FLAG_DISABLE_GPU_TIMEOUT;
+    pc_queue.NodeMask = 1;
     void* queue = nullptr;
-    EXPECT(hr_of(raw(device, 48, word(&kQueueDesc), word(&kQueueIid), word(&queue))) == S_OK);
+    EXPECT(hr_of(raw(device, 48, word(&pc_queue), word(&kQueueIid), word(&queue))) == S_OK);
     EXPECT(xs::is_queue_proxy(queue) && mock->calls[48] == 0 && mock->calls[8] == 1);
-    EXPECT(mock->args[8][0] == word(&kQueueDesc));
+    EXPECT(mock->queue_desc_pointer && mock->queue_desc_pointer != word(&pc_queue) &&  // a PC copy, not the caller's
+           mock->queue_desc.Type == pc_queue.Type && mock->queue_desc.Priority == pc_queue.Priority &&
+           mock->queue_desc.Flags == pc_queue.Flags && mock->queue_desc.NodeMask == pc_queue.NodeMask);
+
+    // The same call with console flag bits the PC flags do not have: only DISABLE_GPU_TIMEOUT survives, and the words
+    // the console keeps past the 16-byte prefix (here a larger caller buffer) are not the description the PC method
+    // receives.
+    struct XboxCommandQueueDesc {
+        D3D12_COMMAND_QUEUE_DESC pc;
+        std::uint64_t xbox_words[2];
+    } xbox_queue{};
+    xbox_queue.pc.Type = D3D12_COMMAND_LIST_TYPE_COMPUTE;
+    xbox_queue.pc.Priority = D3D12_COMMAND_QUEUE_PRIORITY_NORMAL;
+    xbox_queue.pc.Flags = static_cast<D3D12_COMMAND_QUEUE_FLAGS>(
+        static_cast<std::uint32_t>(D3D12_COMMAND_QUEUE_FLAG_DISABLE_GPU_TIMEOUT) | 0x2u);  // 0x2: not a PC flag
+    xbox_queue.pc.NodeMask = 0;
+    xbox_queue.xbox_words[0] = 0x1111111111111111ull;
+    xbox_queue.xbox_words[1] = 0x2222222222222222ull;
+    void* xbox_queue_proxy = nullptr;
+    EXPECT(hr_of(raw(device, 48, word(&xbox_queue), word(&kQueueIid), word(&xbox_queue_proxy))) == S_OK);
+    EXPECT(xs::is_queue_proxy(xbox_queue_proxy) && mock->calls[48] == 0 && mock->calls[8] == 2);
+    EXPECT(mock->queue_desc_pointer && mock->queue_desc_pointer != word(&xbox_queue));
+    EXPECT(mock->queue_desc.Type == D3D12_COMMAND_LIST_TYPE_COMPUTE &&
+           mock->queue_desc.Priority == D3D12_COMMAND_QUEUE_PRIORITY_NORMAL &&
+           mock->queue_desc.Flags == D3D12_COMMAND_QUEUE_FLAG_DISABLE_GPU_TIMEOUT && mock->queue_desc.NodeMask == 0);
 
     // 73 CreateCommandListX(desc, allocator, initialState, riid, out): the type is desc's first word, the allocator
     // proxy is unwrapped, the node mask is 0 and the PC six-argument CreateCommandList (slot 12) is reached.
@@ -757,6 +796,7 @@ int check_xbox_slots() {
 
     EXPECT(release(allocator) == 0 && real_allocator->refs == 0);
     EXPECT(release(queue) == 0);
+    EXPECT(release(xbox_queue_proxy) == 0);
     EXPECT(release(device) == 0 && mock->refs == 0);
     std::printf("%s: device slots 48/73/78/79/80 route to a queue, a list and frame-event tokens without reaching "
                 "the mock's own PC slots\n", g_label);
