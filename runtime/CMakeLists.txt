@@ -487,6 +487,14 @@ if(BUILD_TESTING)
 
   add_executable(retire_tickets_test test/retire_tickets_test.cpp)
   add_test(NAME retire_tickets COMMAND retire_tickets_test)
+  # Console slot 57's deserialized graphics pipeline record (src/graphics_record.h, docs/graphics_record.md): pure
+  # stdlib over synthetic blobs, no device, no GPU and no game files.
+  add_executable(graphics_record_test test/graphics_record_test.cpp src/graphics_record.cpp)
+  target_include_directories(graphics_record_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  if(MSVC)
+    target_compile_options(graphics_record_test PRIVATE /W4 /permissive- /utf-8)
+  endif()
+  add_test(NAME graphics_record COMMAND graphics_record_test)
   # VulkanContext::buffer_at's VA index (runtime/src/buffer_va_index.h): pure stdlib, no Vulkan instance.
   add_executable(buffer_va_index_test test/buffer_va_index_test.cpp)
   add_test(NAME buffer_va_index COMMAND buffer_va_index_test)
