@@ -606,3 +606,22 @@ successful closes), and console list slot 146 needs a barrier conversion the PC 
 So the frontier is presentation, in this order: **PresentX (queue slot 32)** - the one call the frame makes that we refuse,
 with the prepared path in runtime/shims/xbox_present.* - then the command-list lifecycle so the frame's recording is not
 discarded, then the console barrier conversion.
+
+
+## Frontier 2026-11-24 (what the present actually carries, and what it does not unlock)
+
+Queue slot 32 is confirmed as console PresentX: called as `(1, planes, params)`, and the first call's plane measures as
+**token 0x1, ResourceCount 1**, colour space 0 (SDR), scale filter 0, flags 0, with `ppResources` pointing into the
+image's data (`image+0x75E0DE0`) - and the first resource there is **NULL**. So the frame's present currently names no
+resource at all; that is a separate finding to chase (who is supposed to write that pointer, and why it is still zero),
+not something the present wiring can fix.
+
+A second measurement settles the order of work: answering PresentX with S_OK and presenting nothing
+(`LEONIDA_PRESENT_STUB=1`, loudly logged, off by default) speeds the loop - 42,515 submits in 80 s against 30,786 when
+the present is refused - but the drawing calls stay at **zero** (`SetPipelineState`, `DrawInstanced`,
+`DrawIndexedInstanced` all 0 in both runs), and every frame's Close still fails. Present success therefore does not
+unlock the renderer: the frame's recording is still being dropped because its command lists are closed.
+
+So the order is: command-list lifecycle first (make the recording survive; the closed list is why no draw is ever
+recorded), then the console barrier conversion at list slot 146, then the real present wiring - and the null plane
+resource is a fourth thread worth pulling while the lifecycle work happens.

@@ -43,16 +43,17 @@ clean-room approach, plus the boot fixes measured on this machine.
 | Stand-in effect on the stop | none (same instruction, same null) |
 | A8 render-target formats refused | 0 (was 1 per factory call) |
 | Retail boot result | ALIVE; frames submitted, none presented |
-| Frame submits per 140 s run | 78,745 (ExecuteCommandLists ok) |
-| PresentX calls refused per 140 s run | 78,745 |
+| Frame submits per 80 s run (present refused) | 30,786 |
+| Frame submits per 80 s run (present stubbed S_OK) | 42,515 - still 0 draws |
 
-**Where it stops now:** `none - the title runs and submits frames (ALIVE, 78,745 submits per 140 s)` - the frame loop now really submits: console queue slot 35 is the submit (previously mistranslated into a clock calibration pair written over the title's command-list array), and the AMD-only monitorx/mwaitx pair its fence wait uses is emulated. PresentX (console queue slot 32) is the one call per frame still refused, and the frame's command lists are still closed, so its recording is dropped and no draw is recorded.
+**Where it stops now:** `none - the title runs and submits frames (ALIVE, 78,745 submits per 140 s)` - the loop submits 30,786 frames per 80 s run, but every frame records into closed command lists, so the recording is dropped and no draw is ever recorded; making PresentX succeed (+38% frames) does not change that. The present itself names a null plane resource today. Order: command-list lifecycle, then the console barrier, then the real present.
 Measurements and the method behind them: [docs/boot_frontier.md](docs/boot_frontier.md).
 
 Next up:
-- implement console PresentX (queue slot 32) - one call per frame, still refused, prepared path in xbox_present.*
-- command-list lifecycle: reset the real list against its allocator before the first recording call that reaches it closed
+- command-list lifecycle: make the frame's recording survive (its lists are closed, so no draw is ever recorded)
+- find why the present's plane resource pointer is still null (image+0x75E0DE0 holds 0)
 - console list slot 146 barrier conversion (the PC runtime rejects its 64-byte barrier group today)
+- wire the real PresentX to the existing presentation core once the frame has content to present
 
 More: [the full measurement ladder](docs/boot_frontier.md), [the null-object chain trace](docs/null_object_chain.md), [how the other public attempt is built](docs/competitor_intel.md), [incoming reports and tracked findings](docs/issues.md).
 

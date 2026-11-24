@@ -90,23 +90,24 @@
       "value": "ALIVE; frames submitted, none presented"
     },
     {
-      "what": "Frame submits per 140 s run",
-      "value": "78,745 (ExecuteCommandLists ok)"
+      "what": "Frame submits per 80 s run (present refused)",
+      "value": "30,786"
     },
     {
-      "what": "PresentX calls refused per 140 s run",
-      "value": "78,745"
+      "what": "Frame submits per 80 s run (present stubbed S_OK)",
+      "value": "42,515 - still 0 draws"
     }
   ],
   "frontier": {
     "stop": "none - the title runs and submits frames (ALIVE, 78,745 submits per 140 s)",
-    "summary": "the frame loop now really submits: console queue slot 35 is the submit (previously mistranslated into a clock calibration pair written over the title's command-list array), and the AMD-only monitorx/mwaitx pair its fence wait uses is emulated. PresentX (console queue slot 32) is the one call per frame still refused, and the frame's command lists are still closed, so its recording is dropped and no draw is recorded.",
+    "summary": "the loop submits 30,786 frames per 80 s run, but every frame records into closed command lists, so the recording is dropped and no draw is ever recorded; making PresentX succeed (+38% frames) does not change that. The present itself names a null plane resource today. Order: command-list lifecycle, then the console barrier, then the real present.",
     "detail_doc": "docs/boot_frontier.md"
   },
   "next": [
-    "implement console PresentX (queue slot 32) - one call per frame, still refused, prepared path in xbox_present.*",
-    "command-list lifecycle: reset the real list against its allocator before the first recording call that reaches it closed",
-    "console list slot 146 barrier conversion (the PC runtime rejects its 64-byte barrier group today)"
+    "command-list lifecycle: make the frame's recording survive (its lists are closed, so no draw is ever recorded)",
+    "find why the present's plane resource pointer is still null (image+0x75E0DE0 holds 0)",
+    "console list slot 146 barrier conversion (the PC runtime rejects its 64-byte barrier group today)",
+    "wire the real PresentX to the existing presentation core once the frame has content to present"
   ],
   "links": [
     {
