@@ -21,6 +21,7 @@
 #pragma once
 
 #include <windows.h>
+#include <intrin.h>
 #include <set>
 
 #include <atomic>
@@ -628,6 +629,21 @@ inline bool emulate_amd_instruction(EXCEPTION_POINTERS* info) {
         static std::atomic<bool> logged{false};
         if (!logged.exchange(true, std::memory_order_relaxed))
             std::fprintf(stderr, "[rt] emulated the AMD-only clzero instruction (zeroed a 64-byte line)\n");
+        return true;
+    }
+    if (at[0] == 0x0F && at[1] == 0x01 && (at[2] == 0xFA || at[2] == 0xFB)) {   // monitorx / mwaitx
+        // MONITORX arms a monitor on the address in RAX for MWAITX; the pair is how the title's fence wait loop polls a
+        // completed-value cell (docs/fence_slot12.md). Neither instruction exists on an Intel host, so the monitor is a
+        // no-op and the wait becomes a pause that yields: the loop's own memory comparison still decides readiness.
+        if (at[2] == 0xFB) {
+            static std::atomic<unsigned> yields{0};
+            if ((yields.fetch_add(1, std::memory_order_relaxed) & 0xFF) == 0) SwitchToThread();
+            _mm_pause();
+        }
+        c.Rip += 3;
+        static std::atomic<bool> logged_mwait{false};
+        if (!logged_mwait.exchange(true, std::memory_order_relaxed))
+            std::fprintf(stderr, "[rt] emulated the AMD-only monitorx/mwaitx pair (the host has neither)\n");
         return true;
     }
     static std::atomic<int> reported{0};

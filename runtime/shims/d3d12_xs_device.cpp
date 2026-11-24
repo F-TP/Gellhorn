@@ -84,20 +84,25 @@ extern "C" void leonida_register_fence_value_watcher(void* fn) {
 #include <windows.h>
 #include <dxgi1_4.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <intrin.h>  // _ReturnAddress, for the LEONIDA_XS_CALLERS probe
 #include <iterator>
 #include <set>
 #include <mutex>
 #include <new>
 #include <memory>
 #include <string>
+#include <thread>
 #include <utility>
+#include <vector>
 
 namespace rt::d3d12_xs {
 namespace {
@@ -175,6 +180,98 @@ bool trace_enabled() {
         return length > 0 && value[0] != '\0' && value[0] != '0';
     }();
     return enabled;
+}
+
+// LEONIDA_XS_CALLERS=1 (measurement aid): name the title code that drives a proxy slot. The trace and the first-call
+// lines name the method, not the caller, and a slot the title reaches from two places (startup and its frame loop) is
+// only diagnosable with the call site. For every device/queue/fence/allocator/list slot this logs the return address
+// of the first four distinct call sites that reach it, raw, with the four argument words of that call. A return
+// address on the stack is the title's own instruction after the call; the boot's JSONL map event names the image
+// base to convert it to game+RVA. Nothing here changes an answer.
+// LEONIDA_XS_CALLERS_PROFILE=1 also keeps a hit count per site and prints the hottest ones every 20 s, because a boot
+// that runs to its timeout has no shutdown summary: the per-frame call sites are the ones whose counts keep growing.
+enum class CallerKind : unsigned { device, queue, fence, allocator, list };
+constexpr unsigned kCallerKinds = static_cast<unsigned>(CallerKind::list) + 1;
+constexpr unsigned kCallerSites = 4;
+constexpr const char* kCallerKindNames[kCallerKinds] = {"device", "queue", "fence", "allocator", "list"};
+struct CallerSite {
+    std::atomic<std::uint64_t> address{0};
+    std::atomic<std::uint64_t> hits{0};
+};
+CallerSite g_caller_sites[kCallerKinds][kMaxSlots][kCallerSites];
+
+void print_caller_profile() {
+    struct Row {
+        std::uint64_t hits;
+        unsigned kind, slot, site;
+    };
+    std::vector<Row> rows;
+    for (unsigned k = 0; k < kCallerKinds; ++k)
+        for (unsigned s = 0; s < kMaxSlots; ++s)
+            for (unsigned i = 0; i < kCallerSites; ++i) {
+                const std::uint64_t hits = g_caller_sites[k][s][i].hits.load(std::memory_order_relaxed);
+                if (hits) rows.push_back({hits, k, s, i});
+            }
+    std::sort(rows.begin(), rows.end(), [](const Row& a, const Row& b) { return a.hits > b.hits; });
+    std::fprintf(stderr, "[rt] d3d12_xs: caller profile, hottest %zu site(s):\n", std::min<size_t>(rows.size(), 40));
+    for (size_t n = 0; n < rows.size() && n < 40; ++n) {
+        const Row& r = rows[n];
+        const std::uint64_t address = g_caller_sites[r.kind][r.slot][r.site].address.load(std::memory_order_relaxed);
+        std::fprintf(stderr, "[rt] d3d12_xs:   %10llu  %s slot %u caller 0x%llx\n",
+                     static_cast<unsigned long long>(r.hits), kCallerKindNames[r.kind], r.slot,
+                     static_cast<unsigned long long>(address));
+    }
+}
+
+void start_caller_profile() {
+    static std::atomic<bool> started{false};
+    if (started.exchange(true, std::memory_order_relaxed)) return;
+    std::thread([] {
+        for (;;) {
+            std::this_thread::sleep_for(std::chrono::seconds(20));
+            print_caller_profile();
+        }
+    }).detach();
+}
+
+// One relaxed flag read on the hot path; the probe itself only runs when the switch is on.
+bool callers_enabled() {
+    static const bool enabled = [] {
+        char value[8] = {};
+        const DWORD length = GetEnvironmentVariableA("LEONIDA_XS_CALLERS", value, sizeof(value));
+        return length > 0 && value[0] != '\0' && value[0] != '0';
+    }();
+    return enabled;
+}
+
+__declspec(noinline) void note_caller(CallerKind kind, unsigned slot, const void* return_address, std::uint64_t a1,
+                                      std::uint64_t a2, std::uint64_t a3, std::uint64_t a4) {
+    if (!callers_enabled() || !return_address || slot >= kMaxSlots) return;
+    static const bool profile = [] {
+        char value[8] = {};
+        return GetEnvironmentVariableA("LEONIDA_XS_CALLERS_PROFILE", value, sizeof(value)) > 0 && value[0] != '\0' &&
+               value[0] != '0';
+    }();
+    if (profile) start_caller_profile();
+    const auto address = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(return_address));
+    auto& sites = g_caller_sites[static_cast<unsigned>(kind)][slot];
+    for (unsigned i = 0; i < kCallerSites; ++i) {
+        const std::uint64_t site = sites[i].address.load(std::memory_order_relaxed);
+        if (site == address) {
+            sites[i].hits.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        if (site != 0) continue;
+        std::uint64_t expected = 0;
+        if (!sites[i].address.compare_exchange_strong(expected, address, std::memory_order_relaxed)) return;
+        sites[i].hits.fetch_add(1, std::memory_order_relaxed);
+        std::fprintf(stderr, "[rt] d3d12_xs: %s slot %u caller 0x%llx (args 0x%llx 0x%llx 0x%llx 0x%llx)\n",
+                     kCallerKindNames[static_cast<unsigned>(kind)], slot,
+                     static_cast<unsigned long long>(address), static_cast<unsigned long long>(a1),
+                     static_cast<unsigned long long>(a2), static_cast<unsigned long long>(a3),
+                     static_cast<unsigned long long>(a4));
+        return;
+    }
 }
 
 const char* slot_name(unsigned slot) {
@@ -1031,6 +1128,12 @@ struct ListProxy {
     alignas(8) std::uint8_t console_fields[0x600];
     std::atomic<unsigned long> refs;    // past the console body
     unsigned pc_slot_count;             // slots the real list implements; mapped slots past it are refused
+    // LEONIDA_XS_LIST_REOPEN=1 (measurement, docs/render_loop.md): the frame loop records into lists it created and
+    // closed at startup and never resets, which on the console is legal (the allocator owns the recording memory) and
+    // on the PC runtime is not. The probe keeps the allocator the list was created with and resets the real list
+    // before the first recording call that reaches it while closed, so the recording is real instead of dropped.
+    ID3D12CommandAllocator* allocator;  // AddRef'd while the proxy lives
+    std::atomic<int> recording_state;   // 1: the real list is recording, 0: it was closed
 
     void pin_cursor_at_limit() {
         const std::uint64_t at_limit = static_cast<std::uint64_t>(
@@ -1131,7 +1234,9 @@ inline unsigned long list_add_ref(ListProxy* self) { return self->refs.fetch_add
 inline void destroy_list(ListProxy* self) {
     IUnknown* real = self->real;
     DeviceProxy* device = self->device;
+    ID3D12CommandAllocator* allocator = self->allocator;
     delete self;
+    if (allocator) allocator->Release();
     if (real) real->Release();
     if (device) proxy_release(device);
 }
@@ -1181,6 +1286,7 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
                                std::uint64_t a4, std::uint64_t a5, std::uint64_t a6, std::uint64_t a7,
                                std::uint64_t a8, std::uint64_t a9, std::uint64_t a10, std::uint64_t a11,
                                std::uint64_t a12, std::uint64_t a13, std::uint64_t a14) {
+    if (callers_enabled()) note_caller(CallerKind::list, Slot, _ReturnAddress(), a1, a2, a3, a4);
     if constexpr (Slot == 0) {
         return hr_to_u64(list_query_interface(self, reinterpret_cast<const IID*>(a1),
                                               reinterpret_cast<void**>(a2)));
@@ -1201,6 +1307,83 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
                                                reinterpret_cast<void**>(a2)));
     } else {
         note_list_slot(Slot, a1, a2, a3, a4);
+        // LEONIDA_XS_LIST_MUTE=32[,34...] (measurement): answer those console slots with 0 instead of forwarding
+        // them, so a boot can bisect which recording call makes the PC list report its Close as E_INVALIDARG.
+        static const auto muted = [] {
+            std::array<bool, kListSlots> set{};
+            char value[256] = {};
+            if (GetEnvironmentVariableA("LEONIDA_XS_LIST_MUTE", value, sizeof(value)) > 0) {
+                char* at = value;
+                while (*at) {
+                    char* end = nullptr;
+                    const unsigned long slot = std::strtoul(at, &end, 0);
+                    if (slot < kListSlots) set[slot] = true;
+                    if (end == at) break;
+                    at = *end == ',' ? end + 1 : end;
+                }
+            }
+            return set;
+        }();
+        if (muted[Slot]) return 0;
+        // LEONIDA_XS_LIST_DUMP=146[,..] (measurement): the arguments and the pointed-to words of a console list
+        // slot, for the first four calls, to check a console structure against its PC shape.
+        static const auto dumped = [] {
+            std::array<unsigned, 8> set{};
+            char value[64] = {};
+            if (GetEnvironmentVariableA("LEONIDA_XS_LIST_DUMP", value, sizeof(value)) > 0) {
+                char* at = value;
+                unsigned n = 0;
+                while (*at && n < set.size()) {
+                    char* end = nullptr;
+                    set[n++] = static_cast<unsigned>(std::strtoul(at, &end, 0));
+                    if (end == at) break;
+                    at = *end == ',' ? end + 1 : end;
+                }
+            }
+            return set;
+        }();
+        for (unsigned dump_index = 0; dump_index < dumped.size() && dumped[dump_index] != 0; ++dump_index) {
+            const unsigned want = dumped[dump_index];
+            if (want == Slot) {
+                static std::atomic<unsigned> dump_count{0};
+                if (dump_count.fetch_add(1, std::memory_order_relaxed) < 4) {
+                    std::fprintf(stderr, "[rt] d3d12_xs: dump slot %u a1=0x%llx a2=0x%llx a3=0x%llx a4=0x%llx\n",
+                                 Slot, static_cast<unsigned long long>(a1), static_cast<unsigned long long>(a2),
+                                 static_cast<unsigned long long>(a3), static_cast<unsigned long long>(a4));
+                    MEMORY_BASIC_INFORMATION mbi{};
+                    if (a2 && VirtualQuery(reinterpret_cast<const void*>(a2), &mbi, sizeof(mbi)) == sizeof(mbi) &&
+                        mbi.State == MEM_COMMIT && (mbi.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
+                                                                   PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE |
+                                                                   PAGE_EXECUTE_WRITECOPY))) {
+                        const auto* words = reinterpret_cast<const std::uint64_t*>(a2);
+                        const auto* inner = reinterpret_cast<const std::uint64_t*>(words[1]);
+                        MEMORY_BASIC_INFORMATION imbi{};
+                        if (words[1] &&
+                            VirtualQuery(inner, &imbi, sizeof(imbi)) == sizeof(imbi) && imbi.State == MEM_COMMIT) {
+                            std::fprintf(stderr, "[rt] d3d12_xs: dump slot %u [a2[1]]: %016llx %016llx %016llx %016llx %016llx %016llx %016llx %016llx\\n",
+                                         Slot, static_cast<unsigned long long>(inner[0]),
+                                         static_cast<unsigned long long>(inner[1]),
+                                         static_cast<unsigned long long>(inner[2]),
+                                         static_cast<unsigned long long>(inner[3]),
+                                         static_cast<unsigned long long>(inner[4]),
+                                         static_cast<unsigned long long>(inner[5]),
+                                         static_cast<unsigned long long>(inner[6]),
+                                         static_cast<unsigned long long>(inner[7]));
+                        }
+                        std::fprintf(stderr, "[rt] d3d12_xs: dump slot %u [a2]: %016llx %016llx %016llx %016llx "
+                                             "%016llx %016llx %016llx %016llx\n",
+                                     Slot, static_cast<unsigned long long>(words[0]),
+                                     static_cast<unsigned long long>(words[1]),
+                                     static_cast<unsigned long long>(words[2]),
+                                     static_cast<unsigned long long>(words[3]),
+                                     static_cast<unsigned long long>(words[4]),
+                                     static_cast<unsigned long long>(words[5]),
+                                     static_cast<unsigned long long>(words[6]),
+                                     static_cast<unsigned long long>(words[7]));
+                    }
+                }
+            }
+        }
         constexpr unsigned pc = console_to_pc_list_slot(Slot);
         if constexpr (pc == kListNotForwarded) {
             if constexpr (Slot == 148) {
@@ -1228,6 +1411,47 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
                                                      std::uint64_t, std::uint64_t, std::uint64_t,
                                                      std::uint64_t, std::uint64_t);
             auto** const real_vtable = *reinterpret_cast<void***>(self->real);
+            // LEONIDA_XS_LIST_ID=1 (measurement): which list proxy a Close or a recording call lands on, capped.
+            static const bool list_id = [] {
+                char value[8] = {};
+                return GetEnvironmentVariableA("LEONIDA_XS_LIST_ID", value, sizeof(value)) > 0 &&
+                       value[0] != '\0' && value[0] != '0';
+            }();
+            if (list_id && (Slot == 9 || Slot == 10 || Slot == 32 || Slot == 146 || Slot == 34)) {
+                static std::atomic<unsigned> logged{0};
+                if (logged.fetch_add(1, std::memory_order_relaxed) < 12000)
+                    std::fprintf(stderr, "[rt] d3d12_xs: listid slot %u list %p state %d\n", Slot,
+                                 static_cast<void*>(self),
+                                 self->recording_state.load(std::memory_order_relaxed));
+            }
+            // LEONIDA_XS_LIST_REOPEN=1: see ListProxy. A recording call that reaches a closed real list resets it
+            // against the allocator it was created with first, which is what the console's allocator-owned
+            // recording memory does implicitly. Every other forwarded slot behaves exactly as before when it is off.
+            static const bool reopen_closed = [] {
+                char value[8] = {};
+                return GetEnvironmentVariableA("LEONIDA_XS_LIST_REOPEN", value, sizeof(value)) > 0 &&
+                       value[0] != '\0' && value[0] != '0';
+            }();
+            if constexpr (Slot != 9 && Slot != 10) {
+                if (reopen_closed && self->allocator &&
+                    self->recording_state.load(std::memory_order_relaxed) == 0) {
+                    using ResetFn = HRESULT(WINAPI*)(void*, ID3D12CommandAllocator*, ID3D12PipelineState*);
+                    const HRESULT reset = reinterpret_cast<ResetFn>(real_vtable[10])(self->real, self->allocator,
+                                                                                    nullptr);
+                    static std::atomic<unsigned> logged{0};
+                    const unsigned n = logged.fetch_add(1, std::memory_order_relaxed);
+                    if (SUCCEEDED(reset)) {
+                        self->recording_state.store(1, std::memory_order_relaxed);
+                        if (n < 4) std::fprintf(stderr, "[rt] d3d12_xs: reopened list %p for recording (allocator %p)\n",
+                                                static_cast<void*>(self), static_cast<void*>(self->allocator));
+                    } else if (n < 8) {
+                        std::fprintf(stderr,
+                                     "[rt] d3d12_xs: could not reopen list %p: Reset 0x%08x (allocator %p)\n",
+                                     static_cast<void*>(self), static_cast<unsigned>(reset),
+                                     static_cast<void*>(self->allocator));
+                    }
+                }
+            }
             UnwrappedArray heaps;
             if constexpr (Slot == 10) {
                 a1 = unwrap_object(a1);
@@ -1238,8 +1462,23 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
                 if (!heaps.fill(a2, a1)) return 0;
                 if (heaps.data()) a2 = heaps.data();
             }
-            return reinterpret_cast<ForwardFn>(real_vtable[pc])(self->real, a1, a2, a3, a4, a5, a6, a7, a8, a9,
-                                                              a10, a11, a12, a13, a14);
+            const std::uint64_t result = reinterpret_cast<ForwardFn>(real_vtable[pc])(
+                self->real, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14);
+            if constexpr (Slot == 9) {  // Close: a S_OK leaves the real list closed
+                if (list_id) {
+                    static std::atomic<unsigned> close_logged{0};
+                    if (close_logged.fetch_add(1, std::memory_order_relaxed) < 4000)
+                        std::fprintf(stderr, "[rt] d3d12_xs: closeid list %p code 0x%08x\n",
+                                     static_cast<void*>(self),
+                                     static_cast<unsigned>(static_cast<std::uint32_t>(result)));
+                }
+                if (SUCCEEDED(static_cast<HRESULT>(static_cast<std::uint32_t>(result))))
+                    self->recording_state.store(0, std::memory_order_relaxed);
+            } else if constexpr (Slot == 10) {  // Reset: a S_OK starts a recording
+                if (SUCCEEDED(static_cast<HRESULT>(static_cast<std::uint32_t>(result))))
+                    self->recording_state.store(1, std::memory_order_relaxed);
+            }
+            return result;
         }
     }
 }
@@ -1258,7 +1497,8 @@ void** get_list_vtable() {
     return vtable;
 }
 
-HRESULT wrap_list(IUnknown* created, DeviceProxy* device, const IID* riid, void** out) {
+HRESULT wrap_list(IUnknown* created, DeviceProxy* device, ID3D12CommandAllocator* allocator, const IID* riid,
+                  void** out) {
     if (out) *out = nullptr;
     if (!created) return E_FAIL;
     auto* proxy = new (std::nothrow) ListProxy();
@@ -1271,6 +1511,9 @@ HRESULT wrap_list(IUnknown* created, DeviceProxy* device, const IID* riid, void*
     proxy->device = device;
     proxy->refs.store(1, std::memory_order_relaxed);
     proxy->pc_slot_count = detect_list_slot_count(created);
+    proxy->allocator = allocator;
+    proxy->recording_state.store(1, std::memory_order_relaxed);  // CreateCommandList creates it recording
+    if (allocator) allocator->AddRef();
     proxy->pin_cursor_at_limit();
     proxy_add_ref(device);
 
@@ -1334,6 +1577,10 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
                                 std::uint64_t a4, std::uint64_t a5, std::uint64_t a6, std::uint64_t a7,
                                 std::uint64_t a8, std::uint64_t a9, std::uint64_t a10, std::uint64_t a11,
                                 std::uint64_t a12, std::uint64_t a13, std::uint64_t a14) {
+    constexpr CallerKind caller_kind = K == ChildKind::queue   ? CallerKind::queue
+                                       : K == ChildKind::fence ? CallerKind::fence
+                                                               : CallerKind::allocator;
+    if (callers_enabled()) note_caller(caller_kind, Slot, _ReturnAddress(), a1, a2, a3, a4);
     if constexpr (Slot == 0) {
         d3d12_trace::record(child_trace_name<K>(Slot));
         return hr_to_u64(child_query_interface<K>(self, reinterpret_cast<const IID*>(a1),
@@ -1372,30 +1619,24 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
         d3d12_trace::record(child_trace_name<K>(Slot), "unsupported");
         return hr_to_u64(E_NOTIMPL);
 } else if constexpr (K == ChildKind::queue && Slot == 35) {
-        // A console queue extension past the PC table. Measured from the title's call sites: it is called as
-        // (this, arg, pair*) and the caller reads two 64-bit values back from the second argument, so leaving them
-        // unwritten left stack garbage that the title later used as a pointer (observed: a read at 0x100000000).
-        // Answer with a calibration pair taken from the host clock: the same value in both halves, in the host's
-        // counter units, which is what a caller comparing the two deltas needs.
+        // The console's submit. Measured (docs/render_loop.md): the title's frame function calls it as
+        // (count, command-list array, frame token, reserved), with the array being the same storage the startup filled
+        // with command lists; there is no ExecuteCommandLists call anywhere in the boot. The earlier answer here - a
+        // "clock calibration pair" written through a2 - was wrong and overwrote the title's own list pointers with two
+        // QPC words, which is why the frame loop never submitted anything.
         note_child_slot<K>(Slot);
-        LARGE_INTEGER now{};
-        QueryPerformanceCounter(&now);
-        const std::uint64_t ticks = static_cast<std::uint64_t>(now.QuadPart);
-        MEMORY_BASIC_INFORMATION mbi{};
-        const bool writable =
-            a2 && VirtualQuery(reinterpret_cast<const void*>(a2), &mbi, sizeof(mbi)) == sizeof(mbi) &&
-            mbi.State == MEM_COMMIT &&
-            (mbi.Protect & (PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY));
-        if (writable) {
-            auto* out = reinterpret_cast<std::uint64_t*>(a2);
-            out[0] = ticks;
-            out[1] = ticks;
-        }
-        static std::atomic<bool> logged{false};
-        if (!logged.exchange(true, std::memory_order_relaxed))
+        UnwrappedArray lists;
+        if (!lists.fill(a2, a1)) return hr_to_u64(E_OUTOFMEMORY);
+        const std::uint64_t array = lists.data() ? lists.data() : a2;
+        using ExecuteFn = void(WINAPI*)(void*, std::uint64_t, std::uint64_t);
+        reinterpret_cast<ExecuteFn>(self->real_vtable[10])(self->real, a1, array);  // PC ExecuteCommandLists
+        static std::atomic<std::uint64_t> calls{0};
+        const std::uint64_t call = calls.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (call <= 3)
             std::fprintf(stderr,
-                         "[rt] d3d12_xs: queue slot 35 answered as a clock calibration pair (arg 0x%llx, out %p)\n",
-                         static_cast<unsigned long long>(a1), reinterpret_cast<void*>(a2));
+                         "[rt] d3d12_xs: queue slot 35 submitted %llu command list(s) from %p (frame token 0x%llx)\n",
+                         static_cast<unsigned long long>(a1), reinterpret_cast<void*>(array),
+                         static_cast<unsigned long long>(a3));
         d3d12_trace::record(child_trace_name<K>(Slot));
         return hr_to_u64(S_OK);
     } else if constexpr (K == ChildKind::fence && Slot == kConsoleFenceValueAddress) {
@@ -1689,7 +1930,7 @@ HRESULT proxy_create_command_list_x(DeviceProxy* self, std::uint64_t desc_word, 
     const IID pc_iid = IsEqualIID(*riid, kConsoleGraphicsCommandListIid) ? __uuidof(ID3D12GraphicsCommandList) : *riid;
     const HRESULT hr = self->real->CreateCommandList(0, type, allocator, initial_state, pc_iid, &created);
     if (FAILED(hr)) return hr;
-    return wrap_list(static_cast<IUnknown*>(created), self, riid, out);
+    return wrap_list(static_cast<IUnknown*>(created), self, allocator, riid, out);
 }
 
 // Device slot 75: ID3D12Device9::CreateCommandQueue1(desc, creator_id, riid, out), called by slot index.
@@ -2275,6 +2516,7 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
                                 std::uint64_t a4, std::uint64_t a5, std::uint64_t a6, std::uint64_t a7,
                                 std::uint64_t a8, std::uint64_t a9, std::uint64_t a10, std::uint64_t a11,
                                 std::uint64_t a12, std::uint64_t a13, std::uint64_t a14) {
+    if (callers_enabled()) note_caller(CallerKind::device, Slot, _ReturnAddress(), a1, a2, a3, a4);
     if constexpr (Slot == 0) {
         return hr_to_u64(proxy_query_interface(self, reinterpret_cast<const IID*>(a1),
                                                reinterpret_cast<void**>(a2)));

@@ -1129,27 +1129,22 @@ int check_queue_console_slots() {
     // (d) the real queue object's own first 16 bytes are untouched (the old order wrote the descriptor there).
     EXPECT(std::memcmp(front_before, front_after, sizeof(front_before)) == 0);
 
-    // Slot 35, a console extension past the PC table. Measured at two call sites: (this, arg, pair*), where the caller
-    // reads two 64-bit values back from the third argument's pointer (one site passes a global). The proxy answers a
-    // calibration pair - the host counter, the same value in both halves - and only writes a range VirtualQuery sees as
-    // committed and writable. The old E_NOTIMPL left those words as the caller's stack garbage, which it later used as
-    // a pointer.
-    std::uint64_t pair[2] = {0x11, 0x22};
-    EXPECT(hr_of(raw(queue, 35, 0, word(pair))) == S_OK);
-    EXPECT(pair[0] != 0 && pair[0] == pair[1]);
-    // A null out pointer: S_OK, no write, no fault.
-    EXPECT(hr_of(raw(queue, 35)) == S_OK);
-    // A committed but read-only page: reported as not writable, so it is neither written nor faulted on.
-    auto* const read_only = static_cast<std::uint64_t*>(
-        VirtualAlloc(nullptr, 0x1000, MEM_COMMIT | MEM_RESERVE, PAGE_READONLY));
-    EXPECT(read_only != nullptr);
-    EXPECT(read_only[0] == 0 && read_only[1] == 0);  // fresh pages are zero, so a write would show
-    EXPECT(hr_of(raw(queue, 35, 0, word(read_only))) == S_OK);
-    EXPECT(read_only[0] == 0 && read_only[1] == 0);
-    EXPECT(VirtualFree(read_only, 0, MEM_RELEASE) != FALSE);
-    // An address no committed range backs: VirtualQuery fails, and the slot still answers S_OK without writing.
-    EXPECT(hr_of(raw(queue, 35, 0, 0x10)) == S_OK);
-    EXPECT(xs::queue_slot_hits(35) == 4 && real_queue->calls[35] == 0);  // answered by the proxy, never forwarded
+    // Slot 35 is the console's submit (docs/render_loop.md): the title calls it as (count, list array, frame token,
+    // reserved) and there is no ExecuteCommandLists call in the whole boot. The proxy forwards count and the unwrapped
+    // array to PC ExecuteCommandLists (real slot 10). The old "clock calibration pair" answer wrote two QPC words into
+    // that array, i.e. into the title's list pointers.
+    std::uint64_t lists[2] = {0, 0};
+    const unsigned execute_before = real_queue->calls[10];
+    EXPECT(hr_of(raw(queue, 35, 2, word(lists), 0x1122334455667788)) == S_OK);
+    EXPECT(real_queue->calls[10] == execute_before + 1);
+    // The array is copied with its entries unwrapped, so the forwarded pointer is the proxy's copy, not the caller's
+    // array; what matters is the count and that a non-null array reached ExecuteCommandLists.
+    EXPECT(real_queue->args[10][0] == 2 && real_queue->args[10][1] != 0);
+    EXPECT(lists[0] == 0 && lists[1] == 0);  // no write into the caller's array
+    // A null array with count 0 is still a submit call, not a write.
+    EXPECT(hr_of(raw(queue, 35, 0, 0)) == S_OK);
+    EXPECT(real_queue->calls[10] == execute_before + 2);
+    EXPECT(xs::queue_slot_hits(35) == 2 && real_queue->calls[35] == 0);  // answered by the proxy, never forwarded
 
     EXPECT(release(queue) == 0 && real_queue->refs == 0);
     EXPECT(release(device) == 0 && mock->refs == 0);
