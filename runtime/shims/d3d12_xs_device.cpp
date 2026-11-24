@@ -1239,6 +1239,33 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
         d3d12_trace::record(child_trace_name<K>(Slot));
         return hr_to_u64(child_get_device<K>(self, reinterpret_cast<const IID*>(a1),
                                              reinterpret_cast<void**>(a2)));
+    } else if constexpr (K == ChildKind::queue && Slot == 35) {
+        // A console queue extension past the PC table. Measured from the title's call sites: it is called as
+        // (this, arg, pair*) and the caller reads two 64-bit values back from the second argument, so leaving them
+        // unwritten left stack garbage that the title later used as a pointer (observed: a read at 0x100000000).
+        // Answer with a calibration pair taken from the host clock: the same value in both halves, in the host's
+        // counter units, which is what a caller comparing the two deltas needs.
+        note_child_slot<K>(Slot);
+        LARGE_INTEGER now{};
+        QueryPerformanceCounter(&now);
+        const std::uint64_t ticks = static_cast<std::uint64_t>(now.QuadPart);
+        MEMORY_BASIC_INFORMATION mbi{};
+        const bool writable =
+            a2 && VirtualQuery(reinterpret_cast<const void*>(a2), &mbi, sizeof(mbi)) == sizeof(mbi) &&
+            mbi.State == MEM_COMMIT &&
+            (mbi.Protect & (PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY));
+        if (writable) {
+            auto* out = reinterpret_cast<std::uint64_t*>(a2);
+            out[0] = ticks;
+            out[1] = ticks;
+        }
+        static std::atomic<bool> logged{false};
+        if (!logged.exchange(true, std::memory_order_relaxed))
+            std::fprintf(stderr,
+                         "[rt] d3d12_xs: queue slot 35 answered as a clock calibration pair (arg 0x%llx, out %p)\n",
+                         static_cast<unsigned long long>(a1), reinterpret_cast<void*>(a2));
+        d3d12_trace::record(child_trace_name<K>(Slot));
+        return hr_to_u64(S_OK);
     } else {
         note_child_slot<K>(Slot);
         if (Slot >= self->slot_count) {

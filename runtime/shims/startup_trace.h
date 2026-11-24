@@ -195,7 +195,10 @@ inline void log_exception(const EXCEPTION_POINTERS& info) {
                     f += "\"rcx\":" + quote(hex(c.Rcx)) + ",\"rdx\":" + quote(hex(c.Rdx)) +
                          ",\"r8\":" + quote(hex(c.R8)) + ",\"r9\":" + quote(hex(c.R9)) +
                          ",\"rdi\":" + quote(hex(c.Rdi)) + ",\"rsi\":" + quote(hex(c.Rsi)) +
-                         ",\"rsp\":" + quote(hex(c.Rsp)) + ",\"rbp\":" + quote(hex(c.Rbp));
+                         ",\"rsp\":" + quote(hex(c.Rsp)) + ",\"rbp\":" + quote(hex(c.Rbp)) +
+                         ",\"rbx\":" + quote(hex(c.Rbx)) + ",\"r12\":" + quote(hex(c.R12)) +
+                         ",\"r13\":" + quote(hex(c.R13)) + ",\"r14\":" + quote(hex(c.R14)) +
+                         ",\"r15\":" + quote(hex(c.R15));
                     f += "}";
                 }
             }
