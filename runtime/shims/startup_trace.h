@@ -28,6 +28,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include "../src/crash_unwind.h"
 #include <cstdlib>
 #include <mutex>
 #include <string>
@@ -37,6 +38,25 @@
 namespace rt::startup_trace {
 
 namespace detail {
+// The mapped image's .pdata, registered once so a fault can be reported as a chain of image+RVA frames. The walker is
+// given the mapped copy because unwind data is RVA-relative, and the pointers live as long as the process does.
+inline void*& crash_image_base() {
+    static void* base = nullptr;
+    return base;
+}
+inline std::size_t& crash_image_size() {
+    static std::size_t size = 0;
+    return size;
+}
+inline const void*& crash_image_functions() {
+    static const void* functions = nullptr;
+    return functions;
+}
+inline std::size_t& crash_image_function_count() {
+    static std::size_t count = 0;
+    return count;
+}
+
 inline std::atomic<bool> on{false};
 // Intentionally immortal: vectored exception handlers or late teardown paths can still run after normal statics would
 // have been destroyed.
@@ -228,6 +248,18 @@ inline void log_exception(const EXCEPTION_POINTERS& info) {
                 }
             }
             event("exception", f);
+    // LEONIDA_CRASH_REPORT=<path>: write a .pdata-walked report of the faulting thread. Kept behind a switch
+    // because it touches the filesystem on the fault path; the walk itself never allocates.
+    if (detail::crash_image_base()) {
+        wchar_t path[512] = {};
+        const DWORD n = GetEnvironmentVariableW(L"LEONIDA_CRASH_REPORT", path, 512);
+        if (n > 0 && n < 512) {
+            rt::crash_report::set_image(detail::crash_image_base(), detail::crash_image_size(),
+                                       static_cast<const IMAGE_RUNTIME_FUNCTION_ENTRY*>(detail::crash_image_functions()),
+                                       detail::crash_image_function_count());
+            if (info.ContextRecord) rt::crash_report::dump(info.ContextRecord, path);
+        }
+    }
         }
     } catch (...) {
         // Out of memory while formatting: drop the event rather than disturb the process.
@@ -412,6 +444,13 @@ inline LONG CALLBACK handler(EXCEPTION_POINTERS* info) {
 inline void set_poke_lea_address(void* address) { detail::set_poke_lea_address(address); }
 
 // Public entry point for the poke-log diagnostic (the machinery lives in detail).
+inline void set_crash_image(void* base, std::size_t size, const void* functions, std::size_t count) {
+    detail::crash_image_base() = base;
+    detail::crash_image_size() = size;
+    detail::crash_image_functions() = functions;
+    detail::crash_image_function_count() = count;
+}
+
 inline void set_poke_log(const std::uintptr_t* addresses, const unsigned char* originals, unsigned count) {
     detail::set_poke_log_addresses(addresses, originals, count);
 }

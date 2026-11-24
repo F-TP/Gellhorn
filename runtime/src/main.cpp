@@ -408,6 +408,8 @@ int wmain(int argc, wchar_t** argv) {
                         got ? "committed" : "failed");
             std::fflush(stdout);
         }
+        rt::startup_trace::set_crash_image(main_module.base, main_module.size, main_module.function_table,
+                                           main_module.function_count);
         std::printf("running %s\n", main_module.name.c_str());
         std::fflush(stdout);
         // LEONIDA_WATCH_GLOBAL=<hex rva> logs every change of a mapped image's 8-byte global with the millisecond it
