@@ -13,12 +13,18 @@
 // Every device, queue, fence and resource here is a mock that records the calls it gets. No game data, no Xbox DLLs.
 #include "../shims/d3d12_xs_device.h"
 
+// The Vulkan layer's target-view capture (runtime/src/command_list.h). The proxy reads it by its five words for the
+// console ClearRenderTargetView conversion (d3d12_xs_device.cpp, TargetViewWords); these checks keep that mirror tied
+// to the layer's definition, and the mock device writes a real one into a CPU descriptor handle below.
+#include "../src/command_list.h"
+
 #include <d3d12.h>
 #include <windows.h>
 
 #include <crtdbg.h>
 
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -27,6 +33,10 @@
 #include <memory>
 #include <new>
 #include <utility>
+
+static_assert(sizeof(leonida::TargetView) == 24, "the proxy reads the target-view capture as five words");
+static_assert(offsetof(leonida::TargetView, resource) == 0, "target view: resource id first");
+static_assert(offsetof(leonida::TargetView, layer_count) == 16, "target view: layer count is the fourth word");
 
 namespace {
 
@@ -135,6 +145,13 @@ struct Mock {
     HRESULT reset_result;
     unsigned list_events[kMockSlots];
     unsigned list_event_count;
+    // Command list slot 80 (GCL7::Barrier): the groups the proxy forwarded, copied at call time. The proxy translates a
+    // console group whose texture barriers carry no resource into global barriers (d3d12_xs_device.cpp), so the test
+    // reads what the "real" method was actually given, not what the console call passed.
+    unsigned barrier_group_count;
+    D3D12_BARRIER_GROUP barrier_groups[4];
+    D3D12_GLOBAL_BARRIER barrier_globals[8];
+    D3D12_TEXTURE_BARRIER barrier_textures[8];
 };
 
 Mock g_pool[256];
@@ -257,6 +274,14 @@ std::uint64_t mock_call(Mock* m, unsigned slot, const std::uint64_t* words) {
             case 34: case 35: case 46: copy_array(m, slot, a2, a1); break;  // (count, objects, ...)
             case 45: copy_array(m, slot, a1, a3); break;                    // (fences, values, count, ...)
             case 50: copy_array(m, slot, a3, a2); break;                    // (flags, count, objects, fence, value)
+            case 20: {  // CreateRenderTargetView(resource, desc, destination): write the layer's capture, as it does
+                if (!a3) return S_OK;
+                leonida::TargetView view{};
+                view.resource = static_cast<leonida::ResourceId>(a1);
+                view.layer_count = a1 ? 1u : 0u;  // a null resource is a null view: no resource, no layers
+                std::memcpy(reinterpret_cast<void*>(a3), &view, sizeof(view));
+                return S_OK;
+            }
             default: break;
         }
         return S_OK;
@@ -272,6 +297,20 @@ std::uint64_t mock_call(Mock* m, unsigned slot, const std::uint64_t* words) {
     }
     if (m->kind == Kind::queue && slot == 10) copy_array(m, slot, a2, a1);  // ExecuteCommandLists(count, lists)
     if (m->kind == Kind::command_list && slot == 28) copy_array(m, slot, a2, a1);  // SetDescriptorHeaps(count, heaps)
+    if (m->kind == Kind::command_list && slot == 80) {  // Barrier(NumBarrierGroups, pBarrierGroups)
+        m->barrier_group_count = static_cast<unsigned>(a1);
+        const auto* groups = reinterpret_cast<const D3D12_BARRIER_GROUP*>(a2);
+        for (unsigned g = 0; groups && g < m->barrier_group_count && g < std::size(m->barrier_groups); ++g) {
+            m->barrier_groups[g] = groups[g];
+            if (groups[g].Type == D3D12_BARRIER_TYPE_GLOBAL && groups[g].pGlobalBarriers) {
+                for (unsigned i = 0; i < groups[g].NumBarriers && i < std::size(m->barrier_globals); ++i)
+                    m->barrier_globals[i] = groups[g].pGlobalBarriers[i];
+            } else if (groups[g].Type == D3D12_BARRIER_TYPE_TEXTURE && groups[g].pTextureBarriers) {
+                for (unsigned i = 0; i < groups[g].NumBarriers && i < std::size(m->barrier_textures); ++i)
+                    m->barrier_textures[i] = groups[g].pTextureBarriers[i];
+            }
+        }
+    }
     if (m->kind == Kind::command_list && slot == 9) {  // Close: the PC list stops recording
         m->list_closed = true;
         return static_cast<std::uint32_t>(S_OK);
@@ -1485,10 +1524,101 @@ int check_console_command_list() {
     EXPECT(xs::is_command_list_proxy(list7_proxy));
     Mock* real_list7 = reinterpret_cast<Mock*>(xs::command_list_proxy_real_list(list7_proxy));
     EXPECT(real_list7 != nullptr);
-    // Console slot 146 -> PC slot 80 (since 80 < 81 slots)
-    raw(list7_proxy, 146, 0x9999, 0, 0, 0);
+
+    // 6a. Console slot 146 -> PC slot 80: the console's enhanced-barrier call. Its measured groups are PC-shaped
+    // D3D12_BARRIER_GROUPs whose texture entries may carry no resource (the console's "every texture"; PC D3D12 refuses
+    // those and records the list invalid). The proxy rewrites such an entry as a global barrier with the same
+    // sync/access words, passes a real-resource entry through as a texture barrier, and refuses what it cannot
+    // translate without forwarding it (docs/handles_barriers.md).
+    D3D12_TEXTURE_BARRIER console_textures[2]{};
+    constexpr std::uint32_t kAllSubresources = 0xffffffffu;  // D3D12_BARRIER_SUBRESOURCE_RANGE: every subresource
+    console_textures[0].SyncBefore = D3D12_BARRIER_SYNC_ALL_SHADING;
+    console_textures[0].SyncAfter = D3D12_BARRIER_SYNC_RENDER_TARGET;
+    console_textures[0].AccessBefore = D3D12_BARRIER_ACCESS_UNORDERED_ACCESS;
+    console_textures[0].AccessAfter = D3D12_BARRIER_ACCESS_RENDER_TARGET;
+    console_textures[0].LayoutBefore = D3D12_BARRIER_LAYOUT_UNORDERED_ACCESS;
+    console_textures[0].LayoutAfter = D3D12_BARRIER_LAYOUT_RENDER_TARGET;
+    console_textures[0].Subresources.IndexOrFirstMipLevel = kAllSubresources;
+    console_textures[1] = console_textures[0];
+    console_textures[1].pResource = reinterpret_cast<ID3D12Resource*>(static_cast<std::uintptr_t>(0x1dfa7088200ull));
+    console_textures[1].AccessBefore = D3D12_BARRIER_ACCESS_SHADER_RESOURCE;
+    console_textures[1].LayoutBefore = D3D12_BARRIER_LAYOUT_SHADER_RESOURCE;
+    D3D12_BARRIER_GROUP console_group{};
+    console_group.Type = D3D12_BARRIER_TYPE_TEXTURE;
+    console_group.NumBarriers = 2;
+    console_group.pTextureBarriers = console_textures;
+    raw(list7_proxy, 146, 1, word(&console_group), 0, 0);
     EXPECT(real_list7->calls[80] == 1);
-    EXPECT(real_list7->args[80][0] == 0x9999);
+    // The resource-less entry became the first group, a GLOBAL barrier with the sync/access words and no layout.
+    EXPECT(real_list7->barrier_group_count == 2);
+    EXPECT(real_list7->barrier_groups[0].Type == D3D12_BARRIER_TYPE_GLOBAL);
+    EXPECT(real_list7->barrier_groups[0].NumBarriers == 1);
+    EXPECT(real_list7->barrier_globals[0].SyncBefore == D3D12_BARRIER_SYNC_ALL_SHADING);
+    EXPECT(real_list7->barrier_globals[0].SyncAfter == D3D12_BARRIER_SYNC_RENDER_TARGET);
+    EXPECT(real_list7->barrier_globals[0].AccessBefore == D3D12_BARRIER_ACCESS_UNORDERED_ACCESS);
+    EXPECT(real_list7->barrier_globals[0].AccessAfter == D3D12_BARRIER_ACCESS_RENDER_TARGET);
+    // The real-resource entry is forwarded unchanged as a texture barrier.
+    EXPECT(real_list7->barrier_groups[1].Type == D3D12_BARRIER_TYPE_TEXTURE);
+    EXPECT(real_list7->barrier_groups[1].NumBarriers == 1);
+    EXPECT(real_list7->barrier_textures[0].pResource == console_textures[1].pResource);
+    EXPECT(real_list7->barrier_textures[0].SyncBefore == D3D12_BARRIER_SYNC_ALL_SHADING);
+    EXPECT(real_list7->barrier_textures[0].LayoutBefore == D3D12_BARRIER_LAYOUT_SHADER_RESOURCE);
+    EXPECT(real_list7->barrier_textures[0].LayoutAfter == D3D12_BARRIER_LAYOUT_RENDER_TARGET);
+    EXPECT(real_list7->barrier_textures[0].Subresources.IndexOrFirstMipLevel == kAllSubresources);
+
+    // A group whose entries all carry a resource needs no translation: it is forwarded with the console's own pointer.
+    D3D12_TEXTURE_BARRIER one_real = console_textures[1];
+    D3D12_BARRIER_GROUP real_group{};
+    real_group.Type = D3D12_BARRIER_TYPE_TEXTURE;
+    real_group.NumBarriers = 1;
+    real_group.pTextureBarriers = &one_real;
+    raw(list7_proxy, 146, 1, word(&real_group), 0, 0);
+    EXPECT(real_list7->calls[80] == 2);
+    EXPECT(real_list7->args[80][0] == 1);
+    EXPECT(real_list7->args[80][1] == word(&real_group));
+
+    // A group type PC D3D12 has no barrier for, and an unreadable group pointer, are refused: the method is void, so
+    // nothing is forwarded and the list cannot be invalidated by the call.
+    D3D12_BARRIER_GROUP unknown_group{};
+    unknown_group.Type = static_cast<D3D12_BARRIER_TYPE>(7);
+    unknown_group.NumBarriers = 1;
+    const unsigned forwarded_before = real_list7->calls[80];
+    raw(list7_proxy, 146, 1, word(&unknown_group), 0, 0);
+    EXPECT(real_list7->calls[80] == forwarded_before);
+    raw(list7_proxy, 146, 1, static_cast<std::uint64_t>(0x10), 0, 0);
+    EXPECT(real_list7->calls[80] == forwarded_before);
+
+    // 6b. Console slot 52 -> PC slot 48 (ClearRenderTargetView). The retail frame's measured clear passes a handle the
+    // proxy's own CreateRenderTargetView filled with a null view (pResource = 0): the console accepts clearing it (it
+    // clears nothing), PC D3D12 refuses it and marks the list invalid. The proxy answers the null-view clear as that
+    // no-op, forwards a real view unchanged with its CPU handle, and refuses an empty capture no create made.
+    leonida::TargetView null_view{};
+    leonida::TargetView real_view{};
+    float clear_colour[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    // CreateRenderTargetView(pResource, pDesc, destination) on the device proxy: the mock writes the layer's capture.
+    EXPECT(hr_of(raw(device, 20, 0, 0, word(&null_view), 0)) == S_OK);
+    const unsigned clears_before = real_list->calls[48];
+    raw(list_proxy, 52, word(&null_view), word(clear_colour), 0, 0);
+    EXPECT(real_list->calls[48] == clears_before);  // a null view: refused as the no-op clearing it is
+    EXPECT(hr_of(raw(device, 20, 0x7777, 0, word(&real_view), 0)) == S_OK);
+    EXPECT(real_view.resource == 0x7777 && real_view.layer_count == 1);
+    raw(list_proxy, 52, word(&real_view), word(clear_colour), 0, 0);
+    EXPECT(real_list->calls[48] == clears_before + 1);
+    EXPECT(real_list->args[48][0] == word(&real_view));
+    EXPECT(real_list->args[48][1] == word(clear_colour));
+    // A handle no CreateRenderTargetView made: its capture is empty, so it is refused rather than forwarded into a list
+    // PC D3D12 would invalidate.
+    leonida::TargetView unknown_view{};
+    raw(list_proxy, 52, word(&unknown_view), word(clear_colour), 0, 0);
+    EXPECT(real_list->calls[48] == clears_before + 1);
+    // A handle created from a real resource whose capture is empty now (something overwrote the descriptor) is refused
+    // too: it is not the null view the console's no-op covers.
+    leonida::TargetView emptied_view{};
+    EXPECT(hr_of(raw(device, 20, 0x8888, 0, word(&emptied_view), 0)) == S_OK);
+    emptied_view = leonida::TargetView{};
+    raw(list_proxy, 52, word(&emptied_view), word(clear_colour), 0, 0);
+    EXPECT(real_list->calls[48] == clears_before + 1);
+
     EXPECT(release(list7_proxy) == 0 && real_list7->refs == 0);
 
     // Clean up

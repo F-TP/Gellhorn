@@ -1232,6 +1232,425 @@ inline void note_list_slot(unsigned slot, std::uint64_t a1 = 0, std::uint64_t a2
                      static_cast<unsigned long long>(a3), static_cast<unsigned long long>(a4));
 }
 
+// ---- Console recording-call probe (measurement only; LEONIDA_XS_CLEAR_BARRIER_PROBE=1) --------------------------
+//
+// Two console recording calls still invalidate a reopened PC list (docs/list_lifecycle.md section 5): console slot 52
+// (ClearRenderTargetView -> PC slot 48) and console slot 146 (the enhanced-barrier group -> PC GCL7 slot 80). Both need
+// their measured arguments before either can be translated, and this proxy is where a title's console-ABI call is seen
+// before the PC layer does. The probe answers, capped and off by default:
+//   * the clear's four arguments and the 24-byte target-view capture the Vulkan layer stores at the CPU handle;
+//   * whether that handle was the destination of a recent CreateRenderTargetView (a ring of the last destinations and
+//     the resource each was made from);
+//   * every console descriptor heap's requested address and size with the CPU/GPU handles the layer returned (the
+//     create_console_descriptor_heap console-address convention, so a handle can be placed in its heap);
+//   * the barrier group's type, count and every entry's sync/access/layout/resource words.
+// No call is changed: each hook prints and returns, and no control flow depends on the probe.
+static bool readable_range(const void* pointer, std::size_t bytes);  // defined below, for the dumps
+
+bool clear_barrier_probe() {
+    static const bool on = [] {
+        char value[8] = {};
+        return GetEnvironmentVariableA("LEONIDA_XS_CLEAR_BARRIER_PROBE", value, sizeof(value)) > 0 &&
+               value[0] != '\0' && value[0] != '0';
+    }();
+    return on;
+}
+
+// A CPU descriptor handle a CreateRenderTargetView wrote a capture at, with the resource it was made from. Recorded
+// unconditionally (an RTV is created rarely and the recording is one atomic add): the console ClearRenderTargetView
+// conversion asks whether the handle it was given is a slot this proxy itself filled, and with what resource.
+struct RtvDestination {
+    std::uint64_t handle;
+    std::uint64_t resource;
+};
+constexpr unsigned kRtvDestinationRing = 8192;
+RtvDestination g_rtv_destinations[kRtvDestinationRing];
+std::atomic<unsigned> g_rtv_destination_count{0};
+
+void note_rtv_destination(std::uint64_t handle, std::uint64_t resource) {
+    if (!handle) return;
+    RtvDestination& entry =
+        g_rtv_destinations[g_rtv_destination_count.fetch_add(1, std::memory_order_relaxed) % kRtvDestinationRing];
+    entry.resource = resource;
+    entry.handle = handle;
+}
+
+// The resource the most recent CreateRenderTargetView made the view at `handle` from; false when no such destination
+// is in the ring (a handle never written, or one older than the ring).
+bool find_rtv_destination(std::uint64_t handle, std::uint64_t& resource) {
+    const unsigned count = std::min(g_rtv_destination_count.load(std::memory_order_relaxed), kRtvDestinationRing);
+    bool found = false;
+    for (unsigned i = 0; i < count; ++i) {
+        if (g_rtv_destinations[i].handle != handle) continue;
+        resource = g_rtv_destinations[i].resource;
+        found = true;
+    }
+    return found;
+}
+
+// The Vulkan layer's CPU descriptor slot for an RTV or DSV holds a leonida::TargetView
+// (runtime/src/command_list.h): resource id, mip, first array slice, layer count and view format. The proxy reads the
+// words; xs_proxy_mock_test checks this mirror against that header's layout.
+struct TargetViewWords {
+    std::uint64_t resource;
+    std::uint32_t mip;
+    std::uint32_t first_layer;
+    std::uint32_t layer_count;
+    std::uint32_t format;
+};
+static_assert(sizeof(TargetViewWords) == 24, "a target-view capture is five words");
+
+void print_target_view(const char* what, unsigned slot, std::uint64_t handle, std::uint64_t resource) {
+    if (!handle || !readable_range(reinterpret_cast<const void*>(handle), sizeof(TargetViewWords))) {
+        std::fprintf(stderr, "[rt] d3d12_xs: probe slot %u %s handle 0x%llx resource 0x%llx: handle not readable\n",
+                     slot, what, static_cast<unsigned long long>(handle), static_cast<unsigned long long>(resource));
+        return;
+    }
+    TargetViewWords view{};
+    std::memcpy(&view, reinterpret_cast<const void*>(handle), sizeof(view));
+    std::uint64_t created_with = 0;
+    const bool created = find_rtv_destination(handle, created_with);
+    std::fprintf(stderr,
+                 "[rt] d3d12_xs: probe slot %u %s handle 0x%llx resource 0x%llx capture r=0x%llx mip=%u layer0=%u "
+                 "layers=%u format=%u created=%d created_with=0x%llx\n",
+                 slot, what, static_cast<unsigned long long>(handle), static_cast<unsigned long long>(resource),
+                 static_cast<unsigned long long>(view.resource), view.mip, view.first_layer, view.layer_count,
+                 view.format, created ? 1 : 0, static_cast<unsigned long long>(created_with));
+}
+
+// Console slot 52 (ClearRenderTargetView): the CPU handle the title passes, its colour/count/rects and the capture at
+// the handle. Eight calls are enough to see the frame's clear (the first one is what poisons the list).
+void probe_console_clear(unsigned slot, std::uint64_t handle, std::uint64_t colour, std::uint64_t count,
+                         std::uint64_t rects) {
+    static std::atomic<unsigned> logged{0};
+    if (logged.fetch_add(1, std::memory_order_relaxed) >= 8) return;
+    std::fprintf(stderr, "[rt] d3d12_xs: probe slot %u clear args handle=0x%llx colour=0x%llx count=0x%llx rects=0x%llx\n",
+                 slot, static_cast<unsigned long long>(handle), static_cast<unsigned long long>(colour),
+                 static_cast<unsigned long long>(count), static_cast<unsigned long long>(rects));
+    if (colour && readable_range(reinterpret_cast<const void*>(colour), 4 * sizeof(float))) {
+        const auto* c = reinterpret_cast<const float*>(colour);
+        std::fprintf(stderr, "[rt] d3d12_xs: probe slot %u clear colour %g %g %g %g\n", slot,
+                     static_cast<double>(c[0]), static_cast<double>(c[1]), static_cast<double>(c[2]),
+                     static_cast<double>(c[3]));
+    }
+    print_target_view("clear", slot, handle, 0);
+}
+
+// D3D12_BARRIER_GROUP as PC D3D12 declares it: {Type, NumBarriers, union {pGlobalBarriers, pTextureBarriers,
+// pBufferBarriers}}.
+struct BarrierGroupWords {
+    std::uint32_t type;
+    std::uint32_t num_barriers;
+    std::uint64_t barriers;
+};
+static_assert(sizeof(BarrierGroupWords) == 16, "a barrier-group header is 16 bytes");
+
+// Console slot 146 (GCL7::Barrier): every group and every entry's words. Entries are printed as raw qwords so the dump
+// assumes nothing about the console's enhanced-barrier record: the PC shape is 16 bytes for a global barrier, 32 for a
+// buffer one and 64 for a texture one, so that many words are printed per entry.
+void probe_console_barrier(unsigned slot, std::uint64_t groups, std::uint64_t group_pointer) {
+    static std::atomic<unsigned> logged{0};
+    if (logged.fetch_add(1, std::memory_order_relaxed) >= 4) return;
+    std::fprintf(stderr, "[rt] d3d12_xs: probe slot %u barrier groups=%llu groups_ptr=0x%llx\n", slot,
+                 static_cast<unsigned long long>(groups), static_cast<unsigned long long>(group_pointer));
+    if (!group_pointer || !readable_range(reinterpret_cast<const void*>(group_pointer), sizeof(BarrierGroupWords))) {
+        std::fprintf(stderr, "[rt] d3d12_xs: probe slot %u barrier groups are not readable\n", slot);
+        return;
+    }
+    const auto* group = reinterpret_cast<const BarrierGroupWords*>(group_pointer);
+    for (std::uint64_t g = 0; g < groups && g < 8; ++g) {
+        const unsigned words = group[g].type == 0 ? 2 : group[g].type == 1 ? 8 : group[g].type == 2 ? 4 : 0;
+        std::fprintf(stderr, "[rt] d3d12_xs: probe slot %u barrier group %llu type=%u num=%u entries=0x%llx\n", slot,
+                     static_cast<unsigned long long>(g), group[g].type, group[g].num_barriers,
+                     static_cast<unsigned long long>(group[g].barriers));
+        if (!words || !group[g].barriers || !group[g].num_barriers) continue;
+        if (!readable_range(reinterpret_cast<const void*>(group[g].barriers),
+                            static_cast<std::size_t>(group[g].num_barriers) * words * sizeof(std::uint64_t))) {
+            std::fprintf(stderr, "[rt] d3d12_xs: probe slot %u barrier group %llu entries are not readable\n", slot,
+                         static_cast<unsigned long long>(g));
+            continue;
+        }
+        const auto* entry = reinterpret_cast<const std::uint64_t*>(group[g].barriers);
+        for (std::uint32_t i = 0; i < group[g].num_barriers && i < 8; ++i) {
+            std::fprintf(stderr, "[rt] d3d12_xs: probe slot %u barrier group %llu entry %u:", slot,
+                         static_cast<unsigned long long>(g), i);
+            for (unsigned w = 0; w < words; ++w)
+                std::fprintf(stderr, " %016llx", static_cast<unsigned long long>(entry[i * words + w]));
+            std::fprintf(stderr, "\n");
+        }
+    }
+}
+
+// A console descriptor heap: its description, the requested console address/size and the CPU/GPU handles the layer
+// returned, so a clear handle can be placed in its heap.
+void probe_console_heap(unsigned slot, const D3D12_DESCRIPTOR_HEAP_DESC& desc, std::uint64_t address,
+                        std::uint64_t size, std::uint64_t cpu_handle, std::uint64_t gpu_handle) {
+    static std::atomic<unsigned> logged{0};
+    if (logged.fetch_add(1, std::memory_order_relaxed) >= 16) return;
+    std::fprintf(stderr,
+                 "[rt] d3d12_xs: probe device slot %u heap type=%u num=%u flags=0x%x address=0x%llx size=0x%llx "
+                 "cpu=0x%llx gpu=0x%llx\n",
+                 slot, desc.Type, desc.NumDescriptors, static_cast<unsigned>(desc.Flags),
+                 static_cast<unsigned long long>(address), static_cast<unsigned long long>(size),
+                 static_cast<unsigned long long>(cpu_handle), static_cast<unsigned long long>(gpu_handle));
+}
+
+// ---- Console slot 146 (enhanced barriers): a resource-less texture barrier becomes a global barrier ---------------
+//
+// Measured (docs/list_lifecycle.md section 5, docs/handles_barriers.md): the title's frame records
+// `Barrier(1, &group)` where the group is a PC-shaped D3D12_BARRIER_GROUP of type TEXTURE and each entry a 64-byte PC
+// D3D12_TEXTURE_BARRIER. The entries that invalidate the PC list are the ones with pResource == 0 - measured values
+// are SyncBefore 0x1000 (ALL_SHADING), SyncAfter 0x40 (RENDER_TARGET), AccessBefore 0x10 (UNORDERED_ACCESS),
+// AccessAfter 0x8 (RENDER_TARGET), LayoutBefore 3 (UNORDERED_ACCESS), LayoutAfter 2 (RENDER_TARGET), the
+// all-subresources range and no flags. The console accepts a texture barrier without a resource and treats it as
+// "every texture"; PC D3D12 refuses it (CommandList::barrier returns false on a null resource) and marks the whole
+// list invalid, which is what made every reopened frame list report E_INVALIDARG at Close.
+//
+// The provable translation is a GLOBAL barrier carrying the same SyncBefore/SyncAfter/AccessBefore/AccessAfter: a
+// global barrier orders exactly those stages and accesses for every resource, which is a superset of "every texture".
+// The layout numbers have no encoding without a resource (a global barrier has none), so they are dropped and named in
+// the log. A texture entry with a real resource is passed through unchanged (it is the PC shape the layer already
+// records). A group of type GLOBAL or BUFFER is PC-shaped too and is passed through; a buffer barrier with no resource
+// has not been measured and is refused rather than translated by analogy.
+//
+// The buffers are thread_local: the proxy is called from the title's recording threads, one translated call at a time
+// on each, and the arguments are consumed by the forwarded call before the next translation on that thread.
+struct ConsoleBarrierTranslation {
+    D3D12_BARRIER_GROUP groups[3];  // one GLOBAL, one TEXTURE and one BUFFER group at most
+    D3D12_GLOBAL_BARRIER globals[32];
+    D3D12_BUFFER_BARRIER buffers[32];
+    D3D12_TEXTURE_BARRIER textures[32];
+};
+thread_local ConsoleBarrierTranslation g_console_barrier_translation;
+
+// Translates a console slot-146 barrier call's arguments in place. Returns false when the call must be refused (the
+// caller answers 0 without forwarding, so the PC list cannot be invalidated); true when the call may be forwarded,
+// with `groups`/`group_pointer` possibly rewritten to the translation buffers.
+bool translate_console_barrier_groups(std::uint64_t& groups, std::uint64_t& group_pointer) {
+    if (!groups) return true;  // nothing to translate: the call goes on unchanged
+    if (!group_pointer ||
+        !readable_range(reinterpret_cast<const void*>(group_pointer), sizeof(D3D12_BARRIER_GROUP))) {
+        static std::atomic<bool> logged{false};
+        if (!logged.exchange(true, std::memory_order_relaxed))
+            std::fprintf(stderr,
+                         "[rt] d3d12_xs: console barrier (list slot 146) at an unreadable group pointer 0x%llx: "
+                         "refusing it instead of forwarding a barrier PC D3D12 would reject\n",
+                         static_cast<unsigned long long>(group_pointer));
+        return false;
+    }
+    const auto* input = reinterpret_cast<const D3D12_BARRIER_GROUP*>(group_pointer);
+    // The measured console call passes one group; a count this large means the pointer is not the group list the
+    // console call describes. Refusing it (rather than walking it) cannot lose a valid barrier and cannot fault.
+    constexpr std::uint64_t kMostBarrierGroups = 64;
+    if (groups > kMostBarrierGroups) {
+        static std::atomic<bool> logged{false};
+        if (!logged.exchange(true, std::memory_order_relaxed))
+            std::fprintf(stderr,
+                         "[rt] d3d12_xs: console barrier (list slot 146) asks for %llu groups (the measured call "
+                         "passes one); refusing it\n",
+                         static_cast<unsigned long long>(groups));
+        return false;
+    }
+    ConsoleBarrierTranslation& out = g_console_barrier_translation;
+    unsigned global_count = 0;
+    unsigned buffer_count = 0;
+    unsigned texture_count = 0;
+    unsigned translated = 0;
+    for (std::uint64_t g = 0; g < groups; ++g) {
+        const D3D12_BARRIER_GROUP& group = input[g];
+        if (group.Type == D3D12_BARRIER_TYPE_GLOBAL) {
+            if (!group.NumBarriers) continue;
+            if (!group.pGlobalBarriers ||
+                !readable_range(group.pGlobalBarriers, group.NumBarriers * sizeof(D3D12_GLOBAL_BARRIER)) ||
+                global_count + group.NumBarriers > std::size(out.globals)) {
+                static std::atomic<bool> bad{false};
+                if (!bad.exchange(true, std::memory_order_relaxed))
+                    std::fprintf(stderr,
+                                 "[rt] d3d12_xs: console barrier (list slot 146): group %llu is a global-barrier group "
+                                 "whose %u entries are unreadable or do not fit; refusing the call\n",
+                                 static_cast<unsigned long long>(g), group.NumBarriers);
+                return false;
+            }
+            std::memcpy(&out.globals[global_count], group.pGlobalBarriers,
+                        group.NumBarriers * sizeof(D3D12_GLOBAL_BARRIER));
+            global_count += group.NumBarriers;
+        } else if (group.Type == D3D12_BARRIER_TYPE_BUFFER) {
+            if (!group.NumBarriers) continue;
+            if (!group.pBufferBarriers ||
+                !readable_range(group.pBufferBarriers, group.NumBarriers * sizeof(D3D12_BUFFER_BARRIER)) ||
+                buffer_count + group.NumBarriers > std::size(out.buffers)) {
+                static std::atomic<bool> bad{false};
+                if (!bad.exchange(true, std::memory_order_relaxed))
+                    std::fprintf(stderr,
+                                 "[rt] d3d12_xs: console barrier (list slot 146): group %llu is a buffer-barrier group "
+                                 "whose %u entries are unreadable or do not fit; refusing the call\n",
+                                 static_cast<unsigned long long>(g), group.NumBarriers);
+                return false;
+            }
+            for (std::uint32_t i = 0; i < group.NumBarriers; ++i) {
+                if (group.pBufferBarriers[i].pResource) continue;
+                static std::atomic<bool> logged{false};
+                if (!logged.exchange(true, std::memory_order_relaxed))
+                    std::fprintf(stderr,
+                                 "[rt] d3d12_xs: console barrier (list slot 146): buffer barrier without a resource "
+                                 "(sync 0x%x->0x%x, access 0x%x->0x%x, offset 0x%llx size 0x%llx) is not a shape this "
+                                 "proxy has measured; refusing the call rather than guessing\n",
+                                 group.pBufferBarriers[i].SyncBefore, group.pBufferBarriers[i].SyncAfter,
+                                 group.pBufferBarriers[i].AccessBefore, group.pBufferBarriers[i].AccessAfter,
+                                 static_cast<unsigned long long>(group.pBufferBarriers[i].Offset),
+                                 static_cast<unsigned long long>(group.pBufferBarriers[i].Size));
+                return false;
+            }
+            std::memcpy(&out.buffers[buffer_count], group.pBufferBarriers,
+                        group.NumBarriers * sizeof(D3D12_BUFFER_BARRIER));
+            buffer_count += group.NumBarriers;
+        } else if (group.Type == D3D12_BARRIER_TYPE_TEXTURE) {
+            if (!group.NumBarriers) continue;
+            if (!group.pTextureBarriers ||
+                !readable_range(group.pTextureBarriers, group.NumBarriers * sizeof(D3D12_TEXTURE_BARRIER))) {
+                static std::atomic<bool> bad{false};
+                if (!bad.exchange(true, std::memory_order_relaxed))
+                    std::fprintf(stderr,
+                                 "[rt] d3d12_xs: console barrier (list slot 146): group %llu is a texture-barrier group "
+                                 "whose %u entries are unreadable; refusing the call\n",
+                                 static_cast<unsigned long long>(g), group.NumBarriers);
+                return false;
+            }
+            for (std::uint32_t i = 0; i < group.NumBarriers; ++i) {
+                const D3D12_TEXTURE_BARRIER& barrier = group.pTextureBarriers[i];
+                if (barrier.pResource) {
+                    if (texture_count >= std::size(out.textures)) {
+                        static std::atomic<bool> bad{false};
+                        if (!bad.exchange(true, std::memory_order_relaxed))
+                            std::fprintf(stderr,
+                                         "[rt] d3d12_xs: console barrier (list slot 146): more than %zu texture "
+                                         "barriers in one call; refusing it\n",
+                                         std::size(out.textures));
+                        return false;
+                    }
+                    out.textures[texture_count++] = barrier;
+                    continue;
+                }
+                if (global_count >= std::size(out.globals)) {
+                    static std::atomic<bool> bad{false};
+                    if (!bad.exchange(true, std::memory_order_relaxed))
+                        std::fprintf(stderr,
+                                     "[rt] d3d12_xs: console barrier (list slot 146): more than %zu translated "
+                                     "barriers in one call; refusing it\n",
+                                     std::size(out.globals));
+                    return false;
+                }
+                // A resource-less texture barrier: the console's "every texture". A global barrier with the same
+                // sync/access words is the PC encoding; the layouts cannot be carried and are logged.
+                D3D12_GLOBAL_BARRIER& global = out.globals[global_count++];
+                global.SyncBefore = barrier.SyncBefore;
+                global.SyncAfter = barrier.SyncAfter;
+                global.AccessBefore = barrier.AccessBefore;
+                global.AccessAfter = barrier.AccessAfter;
+                ++translated;
+                static std::atomic<unsigned> logged{0};
+                if (logged.fetch_add(1, std::memory_order_relaxed) < 4)
+                    std::fprintf(stderr,
+                                 "[rt] d3d12_xs: console barrier (list slot 146): texture barrier without a resource "
+                                 "(sync 0x%x->0x%x, access 0x%x->0x%x, layout %u->%u, subresource 0x%x) translated to "
+                                 "a global barrier; the console's layouts have no PC encoding without a resource and "
+                                 "are dropped\n",
+                                 barrier.SyncBefore, barrier.SyncAfter, barrier.AccessBefore, barrier.AccessAfter,
+                                 barrier.LayoutBefore, barrier.LayoutAfter,
+                                 barrier.Subresources.IndexOrFirstMipLevel);
+            }
+        } else {
+            static std::atomic<bool> logged{false};
+            if (!logged.exchange(true, std::memory_order_relaxed))
+                std::fprintf(stderr,
+                             "[rt] d3d12_xs: console barrier (list slot 146): barrier group %llu has type %u, not one "
+                             "of the three PC types; refusing the call\n",
+                             static_cast<unsigned long long>(g), group.Type);
+            return false;
+        }
+    }
+    if (!translated) return true;  // every group is already PC-shaped: forward the call untouched
+    unsigned group_count = 0;
+    if (global_count) {
+        out.groups[group_count].Type = D3D12_BARRIER_TYPE_GLOBAL;
+        out.groups[group_count].NumBarriers = global_count;
+        out.groups[group_count].pGlobalBarriers = out.globals;
+        ++group_count;
+    }
+    if (texture_count) {
+        out.groups[group_count].Type = D3D12_BARRIER_TYPE_TEXTURE;
+        out.groups[group_count].NumBarriers = texture_count;
+        out.groups[group_count].pTextureBarriers = out.textures;
+        ++group_count;
+    }
+    if (buffer_count) {
+        out.groups[group_count].Type = D3D12_BARRIER_TYPE_BUFFER;
+        out.groups[group_count].NumBarriers = buffer_count;
+        out.groups[group_count].pBufferBarriers = out.buffers;
+        ++group_count;
+    }
+    groups = group_count;
+    group_pointer = reinterpret_cast<std::uint64_t>(&out.groups[0]);
+    return true;
+}
+
+// ---- Console slot 52 (ClearRenderTargetView): an empty target view is not forwarded -------------------------------
+//
+// Measured (docs/handles_barriers.md): the frame's clear passes a CPU descriptor handle the proxy itself filled. The
+// layer stores its 24-byte target-view capture at that handle, and the measured capture is empty (resource 0, layer
+// count 0) because the title created that descriptor with CreateRenderTargetView(pResource = 0) during setup - a null
+// render-target view. The console accepts clearing a null view (it clears nothing); PC D3D12 refuses it
+// (CommandList::clear_render_target returns false for a view without a resource), which marked the reopened list
+// invalid and failed the frame's Close.
+//
+// The handle convention is therefore not the problem: the handle is exactly the slot the proxy's own
+// CreateRenderTargetView wrote, so there is nothing to remap (a console address that needed the
+// create_console_descriptor_heap mapping would not be in the destination ring). A clear whose capture is a real view
+// is forwarded unchanged. One whose capture is empty cannot be forwarded: the honest answer is to refuse it, and for
+// a slot this proxy created from a null resource that refusal is the exact semantics - clearing nothing - so the
+// frame's recording stays valid and its Close is kept. Returns true when the call may be forwarded.
+bool translate_console_clear(std::uint64_t handle, std::uint64_t colour) {
+    TargetViewWords view{};
+    if (!handle || !readable_range(reinterpret_cast<const void*>(handle), sizeof(view))) {
+        static std::atomic<bool> logged{false};
+        if (!logged.exchange(true, std::memory_order_relaxed))
+            std::fprintf(stderr,
+                         "[rt] d3d12_xs: console ClearRenderTargetView (list slot 52) at an unreadable handle 0x%llx: "
+                         "refusing it instead of forwarding a view PC D3D12 would reject\n",
+                         static_cast<unsigned long long>(handle));
+        return false;
+    }
+    std::memcpy(&view, reinterpret_cast<const void*>(handle), sizeof(view));
+    if (view.resource && view.layer_count) return true;  // a real view: the PC clear records it as usual
+    std::uint64_t created_with = 0;
+    const bool created = find_rtv_destination(handle, created_with);
+    static std::atomic<unsigned> logged{0};
+    if (created && created_with == 0) {
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 2)
+            std::fprintf(stderr,
+                         "[rt] d3d12_xs: console ClearRenderTargetView (list slot 52) on a null view: handle 0x%llx was "
+                         "created by CreateRenderTargetView with pResource=0, so clearing it clears nothing; PC D3D12 "
+                         "refuses it. Refused as the no-op it is (the list stays valid and its Close is kept)\n",
+                         static_cast<unsigned long long>(handle));
+        return false;
+    }
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 2) {
+        if (created)
+            std::fprintf(stderr,
+                         "[rt] d3d12_xs: console ClearRenderTargetView (list slot 52): handle 0x%llx was created from "
+                         "resource 0x%llx but its capture is empty now; refusing it rather than forwarding a view PC "
+                         "D3D12 would reject\n",
+                         static_cast<unsigned long long>(handle), static_cast<unsigned long long>(created_with));
+        else
+            std::fprintf(stderr,
+                         "[rt] d3d12_xs: console ClearRenderTargetView (list slot 52): handle 0x%llx (colour %llx) was "
+                         "not made by CreateRenderTargetView and its capture is empty; refusing it rather than "
+                         "forwarding a view PC D3D12 would reject\n",
+                         static_cast<unsigned long long>(handle), static_cast<unsigned long long>(colour));
+    }
+    return false;
+}
+
 // The retail 1.0.2.1 executable asks device slot 73 for this console command-list IID. The PC SDK does not declare
 // it, so without this the PC CreateCommandList returns E_NOINTERFACE and the title asserts on a null list.
 // {c3827890-4024-474c-98cf-645b51dc4874}
@@ -1349,6 +1768,13 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
             return set;
         }();
         if (muted[Slot]) return 0;
+        // Measurement probe for the two console recording calls that still invalidate a reopened list
+        // (docs/list_lifecycle.md section 5). It prints and returns; the call below is unchanged.
+        if constexpr (Slot == 52) {
+            if (clear_barrier_probe()) probe_console_clear(Slot, a1, a2, a3, a4);
+        } else if constexpr (Slot == 146) {
+            if (clear_barrier_probe()) probe_console_barrier(Slot, a1, a2);
+        }
         // LEONIDA_XS_LIST_DUMP=146[,..] (measurement): the arguments and the pointed-to words of a console list
         // slot, for the first four calls, to check a console structure against its PC shape.
         static const auto dumped = [] {
@@ -1463,6 +1889,19 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
                 }
             }
             UnwrappedArray heaps;
+            // Console slot 146 (enhanced barriers): the console records texture barriers with no resource, which the
+            // console reads as "every texture" and the PC runtime refuses and records as an invalid list. Translate
+            // them to global barriers (translate_console_barrier_groups); a refused call answers 0 (the method is
+            // void) and is never forwarded, so it cannot invalidate the list.
+            if constexpr (Slot == kConsoleBarrier) {
+                if (!translate_console_barrier_groups(a1, a2)) return 0;
+            }
+            // Console slot 52 (ClearRenderTargetView): a clear of an empty target view is refused rather than forwarded
+            // (translate_console_clear); the measured case is a null view the proxy itself created, whose clear is a
+            // no-op on the console. A real view is forwarded unchanged with the same handle.
+            if constexpr (Slot == 52) {
+                if (!translate_console_clear(a1, a2)) return 0;
+            }
             if constexpr (Slot == 10) {
                 a1 = unwrap_object(a1);
                 self->pin_cursor_at_limit();
@@ -2147,6 +2586,8 @@ HRESULT proxy_create_descriptor_heap(DeviceProxy* self, const D3D12_DESCRIPTOR_H
     void* created = nullptr;
     HRESULT hr = E_INVALIDARG;
     bool console_extended = false;
+    std::uint64_t console_address = 0;
+    std::uint64_t console_size = 0;
     if (desc && desc->Type <= D3D12_DESCRIPTOR_HEAP_TYPE_DSV &&
         (desc->Flags & ~D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) == 0) {
         const auto* bytes = reinterpret_cast<const std::uint8_t*>(desc);
@@ -2160,6 +2601,8 @@ HRESULT proxy_create_descriptor_heap(DeviceProxy* self, const D3D12_DESCRIPTOR_H
             // non-zero console VA is present; normal PC 16-byte descs never enter it.
             if (address != 0) {
                 console_extended = true;
+                console_address = address;
+                console_size = size;
                 if (const auto fn = rt::d3d12::console_heap_slot()) {
                     hr = fn(self->real, desc, static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(address), size,
                             __uuidof(ID3D12DescriptorHeap), &created);
@@ -2175,7 +2618,15 @@ HRESULT proxy_create_descriptor_heap(DeviceProxy* self, const D3D12_DESCRIPTOR_H
 
     ID3D12DescriptorHeap* heap = static_cast<ID3D12DescriptorHeap*>(created);
     hr = create_heap_proxy(heap, self, *riid, out);
-    if (FAILED(hr)) heap->Release();
+    if (FAILED(hr)) {
+        heap->Release();
+    } else if (clear_barrier_probe() && console_extended && desc && out && *out) {
+        // Measurement: the requested console range and the handles the layer gave the title, so a console CPU
+        // descriptor handle can be placed in its heap.
+        auto* proxy = static_cast<HeapProxy*>(*out);
+        probe_console_heap(14, *desc, console_address, console_size, heap_get_cpu_handle(proxy).ptr,
+                           heap_get_gpu_handle(proxy).ptr);
+    }
     return hr;
 }
 
@@ -2795,6 +3246,29 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
             static_cast<D3D12_RESOURCE_STATES>(static_cast<std::uint32_t>(a4)),
             reinterpret_cast<const D3D12_CLEAR_VALUE*>(a5), reinterpret_cast<const IID*>(a6),
             reinterpret_cast<void**>(a7)));
+    } else if constexpr (Slot == 20) {
+        // ID3D12Device::CreateRenderTargetView, forwarded unchanged. This branch exists only for the measurement probe:
+        // it records the destination handle and the resource, then prints the capture the layer writes there, so a
+        // console ClearRenderTargetView handle can be compared with the view that was created for it
+        // (LEONIDA_XS_CLEAR_BARRIER_PROBE=1).
+        note_slot(Slot);
+        if (Slot >= self->slot_count) return hr_to_u64(refuse_beyond_device(Slot, self->slot_count));
+        using ForwardFn = std::uint64_t(WINAPI*)(void*, std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t,
+                                                 std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t,
+                                                 std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t,
+                                                 std::uint64_t, std::uint64_t);
+        const std::uint64_t result = reinterpret_cast<ForwardFn>(self->real_vtable[Slot])(
+            self->real, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14);
+        if (a3) {
+            // Record what this destination was created from (used by translate_console_clear to tell a null view the
+            // proxy made from a handle it never saw) and, with the measurement switch on, print the capture.
+            if (clear_barrier_probe()) {
+                static std::atomic<unsigned> logged{0};
+                if (logged.fetch_add(1, std::memory_order_relaxed) < 32) print_target_view("create", Slot, a3, a1);
+            }
+            note_rtv_destination(a3, a1);
+        }
+        return result;
     } else {
         note_slot(Slot);
         // Xbox device slots, before the PC vtable is indexed: the public HLE's 78/79/80 would otherwise reach
