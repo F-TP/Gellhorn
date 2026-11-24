@@ -26,9 +26,9 @@ clean-room approach, plus the boot fixes measured on this machine.
 | Console D3D12 on Vulkan | **done** | device, queues, fences, allocators, descriptor heaps, command lists and pipelines answer; the console queue's two-method slot shift, the A8 render-target format and the fence completed-value address are measured and mapped |
 | Console DirectStorage | **done** | factory, file open, zlib decompression; BCPack and swizzled reads still refuse rather than guess |
 | Boot chain | **done** | the title boots and runs its own loop for at least 400 s with no exception (5.2M traced D3D12 calls in 300 s), after the fence slot 12 answer |
-| Frame loop | in progress | the loop iterates, but its command lists arrive already closed and it never executes or resets them |
-| Presentation | not reached | console PresentX (queue slot 32) still refuses with E_NOTIMPL, once per frame iteration |
 | World rendering | not reached | nothing is executed on the GPU yet, so nothing can be drawn |
+| Frame loop | in progress | 78,745 frame submits succeed per 140 s run (ExecuteCommandLists ok after the console queue slot 35 submit was wired and monitorx/mwaitx were emulated), but each frame's lists are already closed, so its recording is discarded and no draw is ever recorded |
+| Presentation | in progress | console PresentX (queue slot 32) is called once per frame and still refuses with E_NOTIMPL - the frontier |
 
 | Measured | Value |
 |---|---|
@@ -42,17 +42,17 @@ clean-room approach, plus the boot fixes measured on this machine.
 | Distinct graphics programs behind them | 1,264 (945 PS, 319 VS) |
 | Stand-in effect on the stop | none (same instruction, same null) |
 | A8 render-target formats refused | 0 (was 1 per factory call) |
-| Retail boot result | ALIVE 400 s, no exception |
-| Traced D3D12 calls in 300 s | 5,195,024 |
-| Fence completed-value answers in one run | 245,524+ |
+| Retail boot result | ALIVE; frames submitted, none presented |
+| Frame submits per 140 s run | 78,745 (ExecuteCommandLists ok) |
+| PresentX calls refused per 140 s run | 78,745 |
 
-**Where it stops now:** `none - the title runs (ALIVE 400 s, no exception)` - the title now boots into its own frame loop and keeps running: the fence's completed-value address (console fence slot 12) was the last boot-chain refusal. The frontier is now presentation: PresentX (console queue slot 32) is refused once per iteration, and each iteration's two command lists come back already closed - there is no command-list Reset and no ExecuteCommandLists anywhere in the boot, so nothing is recorded, executed or presented.
+**Where it stops now:** `none - the title runs and submits frames (ALIVE, 78,745 submits per 140 s)` - the frame loop now really submits: console queue slot 35 is the submit (previously mistranslated into a clock calibration pair written over the title's command-list array), and the AMD-only monitorx/mwaitx pair its fence wait uses is emulated. PresentX (console queue slot 32) is the one call per frame still refused, and the frame's command lists are still closed, so its recording is dropped and no draw is recorded.
 Measurements and the method behind them: [docs/boot_frontier.md](docs/boot_frontier.md).
 
 Next up:
-- find why the frame's command lists are already closed (no Reset, no ExecuteCommandLists in the whole boot)
-- implement console PresentX (queue slot 32) - the one call the frame loop makes and we refuse
-- convert slot-57 records into real pipelines, now needed for the draws the lists never record
+- implement console PresentX (queue slot 32) - one call per frame, still refused, prepared path in xbox_present.*
+- command-list lifecycle: reset the real list against its allocator before the first recording call that reaches it closed
+- console list slot 146 barrier conversion (the PC runtime rejects its 64-byte barrier group today)
 
 More: [the full measurement ladder](docs/boot_frontier.md), [the null-object chain trace](docs/null_object_chain.md), [how the other public attempt is built](docs/competitor_intel.md), [incoming reports and tracked findings](docs/issues.md).
 

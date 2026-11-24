@@ -29,19 +29,19 @@
       "evidence": "the title boots and runs its own loop for at least 400 s with no exception (5.2M traced D3D12 calls in 300 s), after the fence slot 12 answer"
     },
     {
-      "stage": "Frame loop",
-      "state": "in progress",
-      "evidence": "the loop iterates, but its command lists arrive already closed and it never executes or resets them"
-    },
-    {
-      "stage": "Presentation",
-      "state": "not reached",
-      "evidence": "console PresentX (queue slot 32) still refuses with E_NOTIMPL, once per frame iteration"
-    },
-    {
       "stage": "World rendering",
       "state": "not reached",
       "evidence": "nothing is executed on the GPU yet, so nothing can be drawn"
+    },
+    {
+      "stage": "Frame loop",
+      "state": "in progress",
+      "evidence": "78,745 frame submits succeed per 140 s run (ExecuteCommandLists ok after the console queue slot 35 submit was wired and monitorx/mwaitx were emulated), but each frame's lists are already closed, so its recording is discarded and no draw is ever recorded"
+    },
+    {
+      "stage": "Presentation",
+      "state": "in progress",
+      "evidence": "console PresentX (queue slot 32) is called once per frame and still refuses with E_NOTIMPL - the frontier"
     }
   ],
   "counts": [
@@ -87,26 +87,26 @@
     },
     {
       "what": "Retail boot result",
-      "value": "ALIVE 400 s, no exception"
+      "value": "ALIVE; frames submitted, none presented"
     },
     {
-      "what": "Traced D3D12 calls in 300 s",
-      "value": "5,195,024"
+      "what": "Frame submits per 140 s run",
+      "value": "78,745 (ExecuteCommandLists ok)"
     },
     {
-      "what": "Fence completed-value answers in one run",
-      "value": "245,524+"
+      "what": "PresentX calls refused per 140 s run",
+      "value": "78,745"
     }
   ],
   "frontier": {
-    "stop": "none - the title runs (ALIVE 400 s, no exception)",
-    "summary": "the title now boots into its own frame loop and keeps running: the fence's completed-value address (console fence slot 12) was the last boot-chain refusal. The frontier is now presentation: PresentX (console queue slot 32) is refused once per iteration, and each iteration's two command lists come back already closed - there is no command-list Reset and no ExecuteCommandLists anywhere in the boot, so nothing is recorded, executed or presented.",
+    "stop": "none - the title runs and submits frames (ALIVE, 78,745 submits per 140 s)",
+    "summary": "the frame loop now really submits: console queue slot 35 is the submit (previously mistranslated into a clock calibration pair written over the title's command-list array), and the AMD-only monitorx/mwaitx pair its fence wait uses is emulated. PresentX (console queue slot 32) is the one call per frame still refused, and the frame's command lists are still closed, so its recording is dropped and no draw is recorded.",
     "detail_doc": "docs/boot_frontier.md"
   },
   "next": [
-    "find why the frame's command lists are already closed (no Reset, no ExecuteCommandLists in the whole boot)",
-    "implement console PresentX (queue slot 32) - the one call the frame loop makes and we refuse",
-    "convert slot-57 records into real pipelines, now needed for the draws the lists never record"
+    "implement console PresentX (queue slot 32) - one call per frame, still refused, prepared path in xbox_present.*",
+    "command-list lifecycle: reset the real list against its allocator before the first recording call that reaches it closed",
+    "console list slot 146 barrier conversion (the PC runtime rejects its 64-byte barrier group today)"
   ],
   "links": [
     {

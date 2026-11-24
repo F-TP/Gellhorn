@@ -577,3 +577,32 @@ So the title now boots into its own loop and keeps running. What it does there i
 The frontier is consequently presentation and command-list lifecycle, not the boot chain: why the title's lists are still
 closed at the top of a frame (its `Reset`/`ExecuteCommandLists` calls either never happen or are not the console methods we
 map), and what the console's `PresentX` needs.
+
+
+## Frontier 2026-11-24 (frames are submitted now - PresentX is the last refusal)
+
+Two fixes turned the spinning loop into a submitting renderer:
+
+* **Console queue slot 35 is the submit**, not a clock calibration (docs/render_loop.md measured the call as
+  `(count, list array, frame token, reserved)` from the frame function). The proxy was answering it with a calibration
+  pair written through the caller's pointer - i.e. two QPC values over the title's own command-list array - and the whole
+  boot had **zero** `ExecuteCommandLists` calls. It now unwraps the list array and forwards `(count, lists)` to the PC
+  queue's `ExecuteCommandLists`.
+* **MONITORX/MWAITX are AMD-only** (`0F 01 FA` / `0F 01 FB`) and the title's fence wait loop uses them; an Intel host
+  raises STATUS_ILLEGAL_INSTRUCTION. They are now emulated like `clzero`: the monitor is a no-op, the wait is a pause that
+  yields, and the loop's own memory comparison still decides readiness.
+
+Measured after both: the boot stays ALIVE, and per 140 s run it now makes **78,745 successful `ExecuteCommandLists`
+calls** (78,745 frame submits) where before there were none, 2,292,332 traced D3D12 calls in total.
+
+What the frame still is not: a frame. Each iteration records barriers and clears into **command lists that are still
+closed** (157,486 `Close` calls fail), signals twice, submits, and calls **PresentX (console queue slot 32) 78,745 times,
+which the proxy still refuses with E_NOTIMPL**; no `SetPipelineState` and no draw is ever recorded, so the submission is a
+clear-and-present at best. docs/render_loop.md has the lifecycle evidence: the console recording memory belongs to the
+allocator, the title never re-opens a list, so the layer has to reset the real list against its creating allocator before
+the first recording call that reaches it closed (measured: with the console barrier muted this yields 4,000/4,000
+successful closes), and console list slot 146 needs a barrier conversion the PC runtime rejects today.
+
+So the frontier is presentation, in this order: **PresentX (queue slot 32)** - the one call the frame makes that we refuse,
+with the prepared path in runtime/shims/xbox_present.* - then the command-list lifecycle so the frame's recording is not
+discarded, then the console barrier conversion.
