@@ -79,6 +79,7 @@ extern "C" void leonida_register_fence_value_watcher(void* fn) {
 
 
 
+#include "../src/graphics_pso.h"     // slot 57: the record -> PC graphics pipeline builder (docs/graphics_pso.md)
 #include "../src/shader_library.h"  // leonida::fspx_payload_from_parts for slot 67
 
 #include <windows.h>
@@ -95,6 +96,7 @@ extern "C" void leonida_register_fence_value_watcher(void* fn) {
 #include <cstring>
 #include <intrin.h>  // _ReturnAddress, for the LEONIDA_XS_CALLERS probe
 #include <iterator>
+#include <map>
 #include <set>
 #include <mutex>
 #include <new>
@@ -171,6 +173,43 @@ bool first_call(std::atomic<bool>& seen) {
     if (seen.load(std::memory_order_relaxed)) return false;
     bool expected = false;
     return seen.compare_exchange_strong(expected, true, std::memory_order_relaxed);
+}
+
+// ---- The PC root signatures this device handed out -----------------------------------------------------------------
+//
+// A slot-57 graphics record names its root signature at +0x00 (docs/graphics_record.md section 1). The proxy does not
+// wrap root signatures, so the pointer the title holds is the PC object itself - but the record is deserialized data,
+// and passing an unvalidated pointer to CreateGraphicsPipelineState would make the layer call through it
+// (PipelineState::create_graphics keys the pipeline on pRootSignature). This table is the proof: slot 16 records every
+// root signature the PC device creates, and slot 57 passes the record's +0x00 on only when it is one of these objects
+// (directly, or held in a title-side slot). Anything else is refused as pRootSignature, never guessed.
+constexpr unsigned kRootSignaturesTracked = 256;
+std::atomic<unsigned> g_root_signature_count{0};
+std::mutex g_root_signature_mutex;
+void* g_root_signatures[kRootSignaturesTracked] = {};
+
+void note_root_signature(void* signature) {
+    if (!signature) return;
+    const unsigned index = g_root_signature_count.fetch_add(1, std::memory_order_relaxed);
+    if (index < kRootSignaturesTracked) {
+        const std::lock_guard lock(g_root_signature_mutex);
+        g_root_signatures[index] = signature;
+        return;
+    }
+    static std::atomic<bool> logged{false};
+    if (!logged.exchange(true, std::memory_order_relaxed))
+        std::fprintf(stderr,
+                     "[rt] d3d12_xs: more than %u root signatures created; a slot-57 record naming a later one is "
+                     "refused as pRootSignature rather than passed on\n",
+                     kRootSignaturesTracked);
+}
+
+bool is_tracked_root_signature(const void* signature) {
+    if (!signature) return false;
+    const std::lock_guard lock(g_root_signature_mutex);
+    for (unsigned i = 0; i < kRootSignaturesTracked; ++i)
+        if (g_root_signatures[i] == signature) return true;
+    return false;
 }
 
 bool trace_enabled() {
@@ -2575,6 +2614,471 @@ static bool readable_range(const void* ptr, std::size_t bytes) {
     return true;
 }
 
+// ---- Slot 57: the record converted through rt::graphics_pso --------------------------------------------------------
+//
+// The slot-57 argument is a deserialized pipeline-library graphics record: a root signature, the fixed-function state
+// blob, the input-layout blob and (native program, kind-2 stage blob) pairs in record-slot order
+// (docs/graphics_record.md). rt::graphics_pso::build turns the decoded record plus the caller's inputs into a PC
+// D3D12_GRAPHICS_PIPELINE_STATE_DESC and refuses by field what it cannot prove; this branch supplies the two console
+// inputs the call does not carry - an explicitly logged attachment stand-in and the documented default fixed-function
+// state - and sends the description to the PC device's own CreateGraphicsPipelineState, exactly as slot 67 forwards a
+// compute description.
+//
+// It is also the measurement. One boot asks for ~10,000 distinct records and which field refuses the most decides the
+// next decode (the input-layout element table and its format codes, the state blob, the stage slots or the attachment
+// stand-in). So every refusal is counted by its `why` field and by record stage shape, the first occurrence of each
+// reason is logged with the record's fields, the input-layout blob of each size/count shape is described once (its
+// printable runs and their offsets), a compact histogram is printed every kSlot57SummaryInterval calls and every
+// kSlot57SummarySeconds seconds, and a record is never built from a guessed input layout or a silent state default.
+constexpr std::uint64_t kSlot57SummaryInterval = 2000;
+
+// The attachment stand-in. The slot-57 call carries no render-target or depth-stencil formats, and the sample
+// description lives in the undecoded fixed-function state blob (docs/graphics_pso.md section 5): the whole attachment
+// list is an explicit, logged stand-in - one R8G8B8A8_UNORM target, no depth-stencil, sample count 1 - the same
+// measure family as the documented default state. A wrong format here is a wrong pipeline; the replay creates the
+// draw's image views with the PSO's format, so the console's real formats are still a decode to do.
+constexpr DXGI_FORMAT kSlot57StandinRtvFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
+constexpr UINT kSlot57StandinRenderTargetCount = 1;
+
+// Where the record's +0x00 root signature pointer lands: the PC object itself (the proxy does not wrap root
+// signatures), a title-side slot that holds one (accepted only when the value inside is a tracked PC object, so the
+// mapping is proved), an untracked pointer (refused as pRootSignature), or null.
+enum class Slot57Root : int { kNull = 0, kDirect, kIndirect, kUntracked, kCount };
+
+const char* slot57_root_name(Slot57Root root) {
+    switch (root) {
+        case Slot57Root::kNull: return "null";
+        case Slot57Root::kDirect: return "PC object";
+        case Slot57Root::kIndirect: return "PC object via a title slot";
+        case Slot57Root::kUntracked: return "untracked";
+        default: return "unknown";
+    }
+}
+
+// The record's stage shape in slot order: "ps", "vs+ps", "ps+ms", "ms".
+std::string slot57_shape(const rt::graphics_record::Record& record) {
+    std::string shape;
+    for (std::size_t i = 0; i < record.stage_count; ++i) {
+        if (!shape.empty()) shape += "+";
+        shape += rt::graphics_record::stage_slot_name(record.stages[i].slot);
+    }
+    return shape;
+}
+
+// One distinct record, identified by the bytes the decoder validates (the same identity the old probe printed as an
+// FNV over the first 0x68 bytes; this one covers the whole validated record).
+std::uint64_t slot57_digest(const void* descriptor) {
+    const auto* bytes = static_cast<const std::uint8_t*>(descriptor);
+    std::uint64_t digest = 0xcbf29ce484222325ull;
+    for (std::size_t i = 0; i < rt::graphics_record::kDescriptorValidatedBytes; ++i)
+        digest = (digest ^ bytes[i]) * 0x100000001b3ull;
+    return digest;
+}
+
+// The builder's `why` field, e.g. "input_layout.elements[0].format" from "input_layout.elements[0].format: the ...".
+std::string slot57_reason_field(const std::string& why) {
+    const std::size_t colon = why.find(':');
+    return colon == std::string::npos ? why : why.substr(0, colon);
+}
+
+// The two `why` fields that name a conversion path this tree has not built yet - not a malformed record - answer
+// E_NOTIMPL; every other refusal is an invalid record for this converter.
+HRESULT slot57_refusal_hresult(const std::string& why) {
+    if (why.rfind("record.stages[].slot: a mesh stage", 0) == 0) return E_NOTIMPL;
+    if (why.rfind("input_layout.elements[0].format", 0) == 0) return E_NOTIMPL;
+    return E_INVALIDARG;
+}
+
+// The input-layout blob's printable runs with their offsets, for the first occurrence of each (size, count) shape.
+// The committed decoder accepts only "all names first, then count*28 attribute bytes"; a boot's blobs that do not
+// decode are exactly the ones this line explains (whether the names are contiguous, and where they start). Bounded:
+// at most 8 runs of 4..23 printable bytes, one short line.
+std::string slot57_layout_runs(const rt::graphics_record::Span& layout) {
+    std::string runs;
+    unsigned emitted = 0;
+    for (std::size_t at = 0; at < layout.size && emitted < 8 && runs.size() < 96;) {
+        const std::uint8_t byte = layout.data[at];
+        if (byte < 0x20 || byte > 0x7e) {
+            ++at;
+            continue;
+        }
+        std::size_t end = at;
+        while (end < layout.size && layout.data[end] >= 0x20 && layout.data[end] <= 0x7e && end - at < 23) ++end;
+        if (end - at < 4) {
+            at = end;
+            continue;
+        }
+        char where[24] = {};
+        std::snprintf(where, sizeof(where), "%s+0x%zx:", runs.empty() ? "" : ",", at);
+        runs += where;
+        runs.append(reinterpret_cast<const char*>(layout.data + at), end - at);
+        ++emitted;
+        at = end;
+    }
+    return runs;
+}
+
+// LEONIDA_XS_SLOT57_LAYOUT_DUMP=1 (measurement only, off by default): print the first bytes of one input-layout blob
+// per (size, count@+0x4C) shape. The boot refuses on that blob, and the probe's printable-run offsets only locate the
+// semantic strings; the element table's encoding (where each name, each attribute block and the size relation sit) is
+// the next decode, and one dump of each shape is what measures it. Nothing here changes an answer.
+bool slot57_layout_dump() {
+    static const bool on = [] {
+        char value[8] = {};
+        return GetEnvironmentVariableA("LEONIDA_XS_SLOT57_LAYOUT_DUMP", value, sizeof(value)) > 0 && value[0] != '\0' &&
+               value[0] != '0';
+    }();
+    return on;
+}
+
+struct Slot57ReasonStats {
+    std::uint64_t calls = 0;
+    std::set<std::uint64_t> records;                 // distinct records that refused this way
+    std::map<std::string, std::uint64_t> shapes;     // calls per record stage shape
+};
+
+// One boot's refusal histogram. Bounded: the number of distinct `why` fields and stage shapes is a handful, and the
+// per-reason record sets together hold one digest per distinct record.
+struct Slot57Stats {
+    std::mutex mutex;
+    std::uint64_t calls = 0;
+    std::set<std::uint64_t> records;
+    std::map<std::string, Slot57ReasonStats> reasons;
+    std::set<std::string> reasons_logged;
+    std::uint64_t decoded = 0;
+    std::uint64_t decode_refused = 0;
+    std::uint64_t layout_decoded = 0;
+    std::uint64_t layout_empty = 0;
+    std::uint64_t layout_with_elements = 0;
+    std::uint64_t layout_refused = 0;
+    std::uint64_t stage_bytes_unreadable = 0;
+    std::uint64_t roots[static_cast<int>(Slot57Root::kCount)] = {};
+    std::uint64_t built = 0;        // reached CreateGraphicsPipelineState
+    std::uint64_t pso_created = 0;  // ...and answered S_OK
+    std::map<std::uint32_t, std::uint64_t> results;  // CreateGraphicsPipelineState HRESULTs (S_OK is 0)
+    std::set<std::uint32_t> results_logged;
+    std::map<std::string, std::uint64_t> shapes;
+    // The input-layout blobs the boot carries, by size and by the word the committed decoder reads as the element
+    // count at +0x4C: this is what names the next decode when blobs do not decode (a size/count pair plus the
+    // printable runs' offsets says whether the names are contiguous or interleaved with the attribute bytes).
+    std::map<std::string, std::uint64_t> layout_shapes;
+    std::set<std::string> layout_shapes_logged;
+    unsigned summaries = 0;
+};
+
+Slot57Stats& slot57_stats() {
+    static Slot57Stats stats;
+    return stats;
+}
+
+// What one slot-57 call measured, filled before the single lock that updates the histogram.
+struct Slot57Call {
+    std::uint64_t digest = 0;
+    std::string shape;
+    std::string reason;      // `why` field that refused it; empty when it reached the PC device
+    std::string why;         // the builder's full refusal, for the first-occurrence line
+    bool decoded = false;
+    bool layout_decoded = false;
+    bool stage_bytes_readable = true;
+    std::size_t elements = 0;
+    std::size_t state_bytes = 0;
+    std::size_t layout_bytes = 0;
+    std::string stages;      // "ps 448 B, vs 384 B"
+    std::uint32_t layout_count = 0;  // the word at +0x4C that the committed decoder reads as the element count
+    bool layout_count_read = false;
+    std::string layout_runs;         // printable runs with offsets, for the first occurrence of each layout shape
+    const std::uint8_t* layout_data = nullptr;  // the blob itself, kept for LEONIDA_XS_SLOT57_LAYOUT_DUMP
+    Slot57Root root = Slot57Root::kNull;
+    bool reached_create = false;
+    HRESULT result = E_FAIL;
+};
+
+void print_slot57_summary_locked(Slot57Stats& stats) {
+    ++stats.summaries;
+    std::vector<std::pair<std::string, const Slot57ReasonStats*>> reasons;
+    reasons.reserve(stats.reasons.size());
+    for (const auto& entry : stats.reasons) reasons.emplace_back(entry.first, &entry.second);
+    std::sort(reasons.begin(), reasons.end(),
+              [](const auto& a, const auto& b) { return a.second->calls > b.second->calls; });
+    const std::uint64_t refused_before_call = stats.calls - stats.built;
+    std::fprintf(stderr,
+                 "[rt] d3d12_xs: slot 57 histogram #%u at %llu call(s), %zu distinct record(s): decoded %llu, "
+                 "decode-refused %llu, built %llu, PSOs created %llu, refused before the call %llu\n",
+                 stats.summaries, static_cast<unsigned long long>(stats.calls), stats.records.size(),
+                 static_cast<unsigned long long>(stats.decoded), static_cast<unsigned long long>(stats.decode_refused),
+                 static_cast<unsigned long long>(stats.built), static_cast<unsigned long long>(stats.pso_created),
+                 static_cast<unsigned long long>(refused_before_call));
+    for (std::size_t i = 0; i < reasons.size() && i < 8; ++i) {
+        std::string shapes;
+        for (const auto& entry : reasons[i].second->shapes) {
+            if (!shapes.empty()) shapes += ", ";
+            shapes += entry.first + " " + std::to_string(entry.second);
+        }
+        std::fprintf(stderr, "[rt] d3d12_xs: slot 57   why %s: %llu call(s), %zu distinct record(s) [%s]\n",
+                     reasons[i].first.c_str(), static_cast<unsigned long long>(reasons[i].second->calls),
+                     reasons[i].second->records.size(), shapes.c_str());
+    }
+    std::string shapes;
+    for (const auto& entry : stats.shapes) {
+        if (!shapes.empty()) shapes += ", ";
+        shapes += entry.first + " " + std::to_string(entry.second);
+    }
+    std::fprintf(stderr, "[rt] d3d12_xs: slot 57   stage shapes: %s\n", shapes.empty() ? "none" : shapes.c_str());
+    std::string layout_shapes;
+    for (const auto& entry : stats.layout_shapes) {
+        if (!layout_shapes.empty()) layout_shapes += ", ";
+        layout_shapes += entry.first + " " + std::to_string(entry.second);
+    }
+    std::fprintf(stderr, "[rt] d3d12_xs: slot 57   input-layout blobs by size/count@+0x4C: %s\n",
+                 layout_shapes.empty() ? "none" : layout_shapes.c_str());
+    const std::uint64_t untracked = stats.roots[static_cast<int>(Slot57Root::kUntracked)];
+    std::fprintf(stderr,
+                 "[rt] d3d12_xs: slot 57   gates: input layouts empty %llu, with elements %llu, undecodable %llu; "
+                 "root signatures PC object %llu, via a title slot %llu, untracked %llu, null %llu; unreadable stage "
+                 "bytes %llu; attachments stand-in 1xR8G8B8A8_UNORM (no depth-stencil, sample count 1); fixed-function "
+                 "state stand-in documented_default_state()\n",
+                 static_cast<unsigned long long>(stats.layout_empty),
+                 static_cast<unsigned long long>(stats.layout_with_elements),
+                 static_cast<unsigned long long>(stats.layout_refused),
+                 static_cast<unsigned long long>(stats.roots[static_cast<int>(Slot57Root::kDirect)]),
+                 static_cast<unsigned long long>(stats.roots[static_cast<int>(Slot57Root::kIndirect)]),
+                 static_cast<unsigned long long>(untracked),
+                 static_cast<unsigned long long>(stats.roots[static_cast<int>(Slot57Root::kNull)]),
+                 static_cast<unsigned long long>(stats.stage_bytes_unreadable));
+    if (stats.results.empty()) {
+        std::fprintf(stderr, "[rt] d3d12_xs: slot 57   PC CreateGraphicsPipelineState results: none reached\n");
+        return;
+    }
+    std::string results;
+    for (const auto& entry : stats.results) {
+        if (!results.empty()) results += ", ";
+        if (entry.first == 0)
+            results += "S_OK " + std::to_string(entry.second);
+        else {
+            char code[16] = {};
+            std::snprintf(code, sizeof(code), "0x%08lx", static_cast<unsigned long>(entry.first));
+            results += std::string(code) + " " + std::to_string(entry.second);
+        }
+    }
+    std::fprintf(stderr, "[rt] d3d12_xs: slot 57   PC CreateGraphicsPipelineState results: %s\n", results.c_str());
+}
+
+// Counts one call, logs the first occurrence of a reason / a result, and prints the interval summary.
+void note_slot57(Slot57Call& call) {
+    Slot57Stats& stats = slot57_stats();
+    const std::lock_guard lock(stats.mutex);
+    ++stats.calls;
+    if (call.digest) stats.records.insert(call.digest);
+    if (!call.shape.empty()) ++stats.shapes[call.shape];
+    ++stats.roots[static_cast<int>(call.root)];
+    if (call.decoded) {
+        ++stats.decoded;
+        if (call.layout_count_read) {
+            const std::string layout_shape =
+                std::to_string(call.layout_bytes) + "B/count" + std::to_string(call.layout_count);
+            ++stats.layout_shapes[layout_shape];
+            if (stats.layout_shapes_logged.insert(layout_shape).second) {
+                std::fprintf(stderr,
+                             "[rt] d3d12_xs: slot 57 input-layout blob %zu B (first seen): element count word at "
+                             "+0x4C = %u, printable runs [%s]\n",
+                             call.layout_bytes, call.layout_count, call.layout_runs.c_str());
+                if (slot57_layout_dump() && call.layout_data) {
+                    const std::size_t shown = std::min<std::size_t>(call.layout_bytes, 176);
+                    std::fprintf(stderr, "[rt] d3d12_xs: slot 57 layout dump (%zu B, count %u):", call.layout_bytes,
+                                 call.layout_count);
+                    for (std::size_t i = 0; i < shown; ++i) {
+                        if (i % 32 == 0) std::fprintf(stderr, "\n[rt]   +0x%02zx:", i);
+                        std::fprintf(stderr, " %02x", int(call.layout_data[i]));
+                    }
+                    std::fprintf(stderr, "\n");
+                }
+            }
+        }
+        if (call.layout_decoded) {
+            ++stats.layout_decoded;
+            if (call.elements)
+                ++stats.layout_with_elements;
+            else
+                ++stats.layout_empty;
+        } else {
+            ++stats.layout_refused;
+        }
+        if (!call.stage_bytes_readable) ++stats.stage_bytes_unreadable;
+    } else {
+        ++stats.decode_refused;
+    }
+    if (!call.reason.empty()) {
+        Slot57ReasonStats& reason = stats.reasons[call.reason];
+        ++reason.calls;
+        if (call.digest) reason.records.insert(call.digest);
+        ++reason.shapes[call.shape];
+        if (stats.reasons_logged.insert(call.reason).second) {
+            std::fprintf(stderr, "[rt] d3d12_xs: slot 57 refused (first of \"%s\"): %s\n", call.reason.c_str(),
+                         call.why.c_str());
+            std::fprintf(stderr,
+                         "[rt] d3d12_xs: slot 57   record %016llx shape %s: state %zu B, input layout %zu B/%zu "
+                         "element(s), root signature %s, stages [%s]\n",
+                         static_cast<unsigned long long>(call.digest), call.shape.c_str(), call.state_bytes,
+                         call.layout_bytes, call.elements, slot57_root_name(call.root), call.stages.c_str());
+        }
+    }
+    if (call.reached_create) {
+        ++stats.built;
+        ++stats.results[static_cast<std::uint32_t>(call.result)];
+        if (call.result == S_OK) {
+            ++stats.pso_created;
+            static bool created_logged = false;
+            if (!created_logged) {
+                created_logged = true;
+                std::fprintf(stderr,
+                             "[rt] d3d12_xs: slot 57 created the first PC graphics pipeline (record %016llx shape %s, "
+                             "root signature %s, stages [%s]); the attachment list and the fixed-function state are "
+                             "the logged stand-ins, not decoded console values\n",
+                             static_cast<unsigned long long>(call.digest), call.shape.c_str(),
+                             slot57_root_name(call.root), call.stages.c_str());
+            }
+        } else if (stats.results_logged.insert(static_cast<std::uint32_t>(call.result)).second) {
+            std::fprintf(stderr,
+                         "[rt] d3d12_xs: slot 57 PC CreateGraphicsPipelineState refused the first description with "
+                         "0x%08lx (record %016llx shape %s, root signature %s, stages [%s])\n",
+                         static_cast<unsigned long>(call.result), static_cast<unsigned long long>(call.digest),
+                         call.shape.c_str(), slot57_root_name(call.root), call.stages.c_str());
+        }
+    }
+    if (stats.calls % kSlot57SummaryInterval == 0) print_slot57_summary_locked(stats);
+}
+
+// The record's +0x00 mapped to the PC root signature it names, or null with the class naming why not. A title-side
+// slot holding a PC object is accepted only when the value inside is one this device handed out: the mapping is
+// proved against the root-signature table, never guessed from the pointer's shape.
+Slot57Root classify_slot57_root(void* root, ID3D12RootSignature** pc_root_signature) {
+    *pc_root_signature = nullptr;
+    if (!root) return Slot57Root::kNull;
+    if (is_tracked_root_signature(root)) {
+        *pc_root_signature = static_cast<ID3D12RootSignature*>(root);
+        return Slot57Root::kDirect;
+    }
+    if (readable_range(root, sizeof(void*))) {
+        void* inner = nullptr;
+        std::memcpy(&inner, root, sizeof(inner));
+        if (inner && is_tracked_root_signature(inner)) {
+            *pc_root_signature = static_cast<ID3D12RootSignature*>(inner);
+            return Slot57Root::kIndirect;
+        }
+    }
+    return Slot57Root::kUntracked;
+}
+
+// One slot-57 call: decode, fill the caller's inputs, build, and forward the description. Returns the HRESULT the
+// title gets: S_OK when the PC device created the pipeline, the named refusal otherwise (never a silent success).
+HRESULT convert_slot57_record(DeviceProxy* self, const void* desc, const IID* riid, void** out) {
+    *out = nullptr;  // a refusal never leaves a stale PSO; the PC device nulls it too
+    Slot57Call call;
+
+    // The stand-in declaration, once: a reader of the histogram has to know the attachment list and the state it
+    // measured were substitutes. Both are required to be explicit (docs/graphics_pso.md sections 4 and 5).
+    static std::atomic<bool> standins_logged{false};
+    if (!standins_logged.exchange(true, std::memory_order_relaxed))
+        std::fprintf(stderr,
+                     "[rt] d3d12_xs: slot 57 stand-ins (logged once): attachments = 1x R8G8B8A8_UNORM, no "
+                     "depth-stencil, sample count 1 (the slot-57 call carries no formats; the console's are in the "
+                     "undecoded state blob); fixed-function state = rt::graphics_pso::documented_default_state() "
+                     "(docs/graphics_pso.md section 4). Refusals are counted by field and printed every %llu calls; a "
+                     "record that cannot be built returns its named refusal\n",
+                     static_cast<unsigned long long>(kSlot57SummaryInterval));
+
+    // 1. The record's own bytes. decode() validates the shape and never follows the record's pointers, so the spans it
+    //    returns are range-checked here before anything dereferences them.
+    if (!desc || !readable_range(desc, rt::graphics_record::kDescriptorValidatedBytes)) {
+        call.reason = "record";
+        call.why = "the slot-57 descriptor is not readable for the 0x108 bytes the decoder validates";
+        note_slot57(call);
+        return E_INVALIDARG;
+    }
+    call.digest = slot57_digest(desc);
+    rt::graphics_record::Record record;
+    if (!rt::graphics_record::decode(desc, rt::graphics_record::kDescriptorValidatedBytes, &record)) {
+        call.reason = "decode";
+        call.why = "the record does not decode as a deserialized graphics pipeline record (docs/graphics_record.md)";
+        note_slot57(call);
+        return E_INVALIDARG;
+    }
+    call.decoded = true;
+    call.shape = slot57_shape(record);
+    call.state_bytes = record.state.size;
+    call.layout_bytes = record.input_layout.size;
+    for (std::size_t i = 0; i < record.stage_count; ++i) {
+        if (!call.stages.empty()) call.stages += ", ";
+        call.stages += rt::graphics_record::stage_slot_name(record.stages[i].slot);
+        call.stages += " " + std::to_string(record.stages[i].program.size) + " B";
+        if (!readable_range(record.stages[i].program.data, record.stages[i].program.size))
+            call.stage_bytes_readable = false;
+    }
+
+    // 2. The two blobs the builder reads are checked for readability first: the decoder copies only pointers.
+    if (!readable_range(record.state.data, record.state.size)) {
+        call.reason = "record.state";
+        call.why = "the fixed-function state blob the record points at is not readable";
+        note_slot57(call);
+        return E_INVALIDARG;
+    }
+    if (!readable_range(record.input_layout.data, record.input_layout.size)) {
+        call.reason = "record.input_layout";
+        call.why = "the input-layout blob the record points at is not readable";
+        note_slot57(call);
+        return E_INVALIDARG;
+    }
+    std::vector<rt::graphics_record::Element> elements;
+    call.layout_decoded = rt::graphics_record::decode_input_layout(record.input_layout, &elements);
+    call.elements = elements.size();
+    // The word the committed decoder reads as the element count, and the blob's printable runs with their offsets:
+    // when a layout does not decode, this pair is what says whether the names are contiguous (all names, then the
+    // attribute blocks) or interleaved with them - the boundary the next decode has to establish.
+    if (record.input_layout.size >= rt::graphics_record::kInputLayoutCountOffset + sizeof(std::uint32_t)) {
+        std::memcpy(&call.layout_count, record.input_layout.data + rt::graphics_record::kInputLayoutCountOffset,
+                    sizeof(call.layout_count));
+        call.layout_count_read = true;
+    }
+    call.layout_runs = slot57_layout_runs(record.input_layout);
+    call.layout_data = record.input_layout.data;
+    if (!call.stage_bytes_readable) {
+        call.reason = "record.stages[].program";
+        call.why = "a stage's native program bytes the record points at are not readable";
+        note_slot57(call);
+        return E_INVALIDARG;
+    }
+
+    // 3. The caller's inputs: the root signature the record names (proved against the table above), the explicitly
+    //    logged attachment stand-in and the documented default fixed-function state. Nothing here is a silent default.
+    ID3D12RootSignature* pc_root_signature = nullptr;
+    call.root = classify_slot57_root(record.root_signature, &pc_root_signature);
+    rt::graphics_pso::GraphicsPsoInputs inputs{};
+    inputs.root_signature = pc_root_signature;  // null is refused by name as pRootSignature, never replaced silently
+    inputs.render_target_count = kSlot57StandinRenderTargetCount;
+    inputs.rtv_formats[0] = kSlot57StandinRtvFormat;
+    inputs.dsv_format = DXGI_FORMAT_UNKNOWN;
+    inputs.defaults = rt::graphics_pso::documented_default_state();
+    for (std::size_t i = 0; i < record.stage_count; ++i)
+        inputs.stages[record.stages[i].slot] = {record.stages[i].program.data, record.stages[i].program.size};
+
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pc{};
+    std::string why;
+    if (!rt::graphics_pso::build(record, inputs, &pc, &why)) {
+        call.reason = slot57_reason_field(why);
+        call.why = why;
+        note_slot57(call);
+        return slot57_refusal_hresult(why);
+    }
+
+    // 4. The PC device's own CreateGraphicsPipelineState, with the same forwarding shape slot 67 uses for compute: the
+    //    description, the title's riid and out pointer, and the real HRESULT back. The native stages resolve there
+    //    (docs/graphics_pso.md section 2), so an unresolvable program is its E_INVALIDARG/E_NOTIMPL, not ours.
+    call.reached_create = true;
+    call.result = self->real->CreateGraphicsPipelineState(&pc, *riid, out);
+    note_slot57(call);
+    return call.result;
+}
+
 HRESULT proxy_create_descriptor_heap(DeviceProxy* self, const D3D12_DESCRIPTOR_HEAP_DESC* desc, const IID* riid,
                                      void** out) {
     note_slot(14);
@@ -2818,12 +3322,15 @@ HRESULT proxy_create_graphics_pipeline_probe(DeviceProxy* self, const void* desc
                          names.empty() ? "none" : names.c_str());
         }
     }
-    // The record has no converter yet (runtime/src/graphics_record.h decodes it, but the fixed-function state blob and
-    // the input layout's formats are still unknown), so the slot refuses and the title gets a null PSO. With
-    // LEONIDA_STANDIN_PIPELINES on, the Vulkan device hands the title a real graphics pipeline built from this
-    // project's own VS+PS pair instead (d3d12_vulkan_device.cpp, create_standin_graphics_pipeline), which measures
-    // whether this refusal is what stops the boot. The creator answers E_NOTIMPL with the switch off, so that boot is
-    // unchanged. Diagnostic only: the stand-in's draws do not do the record's work.
+    // The record is converted through rt::graphics_pso (docs/graphics_pso.md section 5): a built description goes to
+    // the PC device's own CreateGraphicsPipelineState, a refused one returns its named field and the title gets a null
+    // PSO exactly as the probe answered before. Which field refuses, counted over the boot, is the measurement.
+    const HRESULT converted = convert_slot57_record(self, desc, riid, out);
+    if (converted == S_OK) return S_OK;
+    // With LEONIDA_STANDIN_PIPELINES on, the Vulkan device hands the title a real graphics pipeline built from this
+    // project's own VS+PS pair instead (d3d12_vulkan_device.cpp, create_standin_graphics_pipeline), so a boot measures
+    // whether the refusal is what the title is waiting for without changing what the default boot answers. Diagnostic
+    // only: the stand-in's draws do not do the record's work.
     if (const auto create_standin = rt::d3d12::graphics_standin_slot()) {
         // The record's stage count (the measured slots are 0 PS, 1 VS, 2 MS: docs/graphics_record.md section 1),
         // reported on the stand-in lines so a reader can tell the shape that was stood in for.
@@ -2846,8 +3353,8 @@ HRESULT proxy_create_graphics_pipeline_probe(DeviceProxy* self, const void* desc
             if (count <= 3)
                 std::fprintf(stderr,
                              "[rt] d3d12_xs: STAND-IN graphics pipeline #%llu (record stage count %u): the slot-57 "
-                             "record has no converter yet, so a pipeline built from this project's own VS+PS pair is "
-                             "handed over; its draws will not do the record's work\n",
+                             "record was refused by the converter, so a pipeline built from this project's own VS+PS "
+                             "pair is handed over; its draws will not do the record's work\n",
                              static_cast<unsigned long long>(count), stage_count);
             else
                 std::fprintf(stderr, "[rt] d3d12_xs: STAND-IN graphics pipeline #%llu (record stage count %u)\n",
@@ -2858,11 +3365,11 @@ HRESULT proxy_create_graphics_pipeline_probe(DeviceProxy* self, const void* desc
         if (standin_failures.fetch_add(1, std::memory_order_relaxed) < 3)
             std::fprintf(stderr,
                          "[rt] d3d12_xs: slot 57 graphics stand-in not created (0x%08lx, record stage count %u); the "
-                         "slot refuses as before\n",
+                         "converter's refusal is returned\n",
                          static_cast<unsigned long>(standin), stage_count);
         *out = nullptr;
     }
-    return E_NOTIMPL;
+    return converted;
 }
 
 // The Xbox slot 67 creates a compute pipeline from native GPU code: (desc, riid, out), named
@@ -3072,6 +3579,19 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
         return hr_to_u64(proxy_create_descriptor_heap(
             self, reinterpret_cast<const D3D12_DESCRIPTOR_HEAP_DESC*>(a1),
             reinterpret_cast<const IID*>(a2), reinterpret_cast<void**>(a3)));
+    } else if constexpr (Slot == 16) {
+        // CreateRootSignature, forwarded unchanged. The created PC object is remembered so slot 57 can prove that the
+        // root signature a record names at +0x00 is one this device handed out (the root-signature table above); with
+        // no proof the builder refuses it as pRootSignature instead of the layer calling through an unchecked pointer.
+        note_slot(16);
+        if (Slot >= self->slot_count) return hr_to_u64(refuse_beyond_device(16, self->slot_count));
+        if (!a4) return hr_to_u64(E_POINTER);
+        auto* const out = reinterpret_cast<void**>(a5);
+        const HRESULT hr = self->real->CreateRootSignature(
+            static_cast<UINT>(a1), reinterpret_cast<const void*>(a2), static_cast<SIZE_T>(a3),
+            *reinterpret_cast<const IID*>(a4), out);
+        if (SUCCEEDED(hr) && out && *out) note_root_signature(*out);
+        return hr_to_u64(hr);
     } else if constexpr (Slot == 61) {
         // The console calls this slot with two arguments from 192 sites during pipeline setup, while the PC interface's
         // slot 61 is CreateMetaCommand (three arguments): forwarding by number makes the layer read -1. Identify what

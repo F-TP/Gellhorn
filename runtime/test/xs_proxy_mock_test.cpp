@@ -18,6 +18,14 @@
 // to the layer's definition, and the mock device writes a real one into a CPU descriptor handle below.
 #include "../src/command_list.h"
 
+// The proxy's slot-57 branch calls the graphics record decoder and the graphics PSO builder (runtime/src/graphics_*),
+// which the gta6rt build links from gta6rt_d3d12_com. This executable compiles the proxy source on its own and links no
+// runtime library, so the two sources are compiled in here: the branch is then exercised against the real decoder and
+// builder, never a second hand-written copy of their contract (their own unit tests are graphics_record_test and
+// graphics_pso_test).
+#include "../src/graphics_record.cpp"
+#include "../src/graphics_pso.cpp"
+
 #include <d3d12.h>
 #include <windows.h>
 
@@ -97,7 +105,7 @@ void test_fence_watcher(IUnknown* real_fence, const std::shared_ptr<std::atomic<
 
 // ---- Mocks ----
 
-enum class Kind { device, queue, fence, resource, allocator, command_list, heap };
+enum class Kind { device, queue, fence, resource, allocator, command_list, heap, root_signature, pipeline_state };
 
 constexpr unsigned kMockSlots = 128;
 constexpr std::uint64_t kFenceHandle = 0x1000, kResourceHandle = 0x2000;  // the handles the mock device opens
@@ -136,6 +144,9 @@ struct Mock {
     // Device slot 12 (CreateCommandList): the IID the PC method was asked for, by value. Slot 73 asks the host for the
     // base GraphicsCommandList interface and passes its own copy of the title's IID, so the pointer is not the title's.
     GUID list_iid;
+    // Device slot 10 (PC CreateGraphicsPipelineState): the description the proxy's slot-57 conversion built, copied at
+    // call time. It is the proxy's own structure, so the test reads its contents rather than a pointer's identity.
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC graphics_desc;
     // Command list: the real PC list's own lifecycle. The proxy tracks the recording state itself and reopens a
     // closed list before a forwarded recording call (docs/list_lifecycle.md), so the mock models the two slots that
     // define that state: Close (9) leaves the real list closed, Reset (10) reopens it and reports reset_result
@@ -205,6 +216,8 @@ bool mock_has(const Mock* m, REFIID iid) {
             return IsEqualIID(iid, __uuidof(ID3D12Fence)) || (m->fence1 && IsEqualIID(iid, __uuidof(ID3D12Fence1)));
         case Kind::resource: return IsEqualIID(iid, __uuidof(ID3D12Resource));
         case Kind::heap: return IsEqualIID(iid, __uuidof(ID3D12DescriptorHeap));
+        case Kind::root_signature: return IsEqualIID(iid, __uuidof(ID3D12RootSignature));
+        case Kind::pipeline_state: return IsEqualIID(iid, __uuidof(ID3D12PipelineState));
         case Kind::command_list:
             if (IsEqualIID(iid, __uuidof(ID3D12CommandList)) ||
                 IsEqualIID(iid, __uuidof(ID3D12GraphicsCommandList))) return true;
@@ -368,6 +381,45 @@ HRESULT WINAPI mock_create_command_list(Mock* self, std::uint64_t node_mask, std
     return mock_query(child, riid, out);
 }
 
+// PC ID3D12Device::CreateRootSignature (slot 16): the proxy forwards it unchanged and remembers the object it made, so
+// slot 57 can prove that a record's +0x00 root signature is one this device handed out. The mock makes a
+// root-signature object and hands it out, as the PC device does. The table is shared by every mock kind, and the
+// console queue's methods are shifted onto PC slots 14..18, so a queue's slot 16 stays the generic forwarded call.
+HRESULT WINAPI mock_create_root_signature(Mock* self, UINT node_mask, const void* blob, SIZE_T size, const IID* riid,
+                                          void** out) {
+    if (self->kind != Kind::device)
+        return static_cast<HRESULT>(static_cast<std::uint32_t>(mock_slot<16>(
+            self, node_mask, reinterpret_cast<std::uint64_t>(blob), size, reinterpret_cast<std::uint64_t>(riid),
+            reinterpret_cast<std::uint64_t>(out))));
+    ++self->calls[16];
+    self->args[16][0] = node_mask;
+    self->args[16][1] = reinterpret_cast<std::uint64_t>(blob);
+    self->args[16][2] = size;
+    self->args[16][3] = reinterpret_cast<std::uint64_t>(riid);
+    self->args[16][4] = reinterpret_cast<std::uint64_t>(out);
+    return mock_create(self, Kind::root_signature, reinterpret_cast<std::uint64_t>(riid),
+                       reinterpret_cast<std::uint64_t>(out));
+}
+
+// PC ID3D12Device::CreateGraphicsPipelineState (slot 10): the proxy's slot-57 conversion hands it the description it
+// built. The mock copies that description and hands out a pipeline-state object, like the PC device; create_result and
+// create_null (as on creation) choose the answer, so the test can check an honest failed HRESULT comes back unchanged.
+// The queue proxy also forwards onto its real object's slot 10, so another mock kind keeps the generic thunk.
+HRESULT WINAPI mock_create_graphics_pipeline_state(Mock* self, const D3D12_GRAPHICS_PIPELINE_STATE_DESC* desc,
+                                                   const IID* riid, void** out) {
+    if (self->kind != Kind::device)
+        return static_cast<HRESULT>(static_cast<std::uint32_t>(mock_slot<10>(
+            self, reinterpret_cast<std::uint64_t>(desc), reinterpret_cast<std::uint64_t>(riid),
+            reinterpret_cast<std::uint64_t>(out), 0, 0)));
+    ++self->calls[10];
+    self->args[10][0] = reinterpret_cast<std::uint64_t>(desc);
+    self->args[10][1] = reinterpret_cast<std::uint64_t>(riid);
+    self->args[10][2] = reinterpret_cast<std::uint64_t>(out);
+    if (desc) self->graphics_desc = *desc;
+    return mock_create(self, Kind::pipeline_state, reinterpret_cast<std::uint64_t>(riid),
+                       reinterpret_cast<std::uint64_t>(out));
+}
+
 // PC ID3D12CommandQueue::GetDesc returns D3D12_COMMAND_QUEUE_DESC by value, so MSVC's convention hands that method the
 // hidden return buffer in RCX and the object in RDX - the opposite of the title's (queue, buffer) call, which is why
 // the proxy has a conversion for slot 18 (measured: forwarded the generic way, the descriptor went into the front of
@@ -390,7 +442,9 @@ void** mock_vtable() {
     static void* table[kMockSlots];
     static const bool filled = [] {
         fill_mock_vtable(table, std::make_index_sequence<kMockSlots>{});
+        table[10] = reinterpret_cast<void*>(&mock_create_graphics_pipeline_state);  // PC CreateGraphicsPipelineState
         table[12] = reinterpret_cast<void*>(&mock_create_command_list);
+        table[16] = reinterpret_cast<void*>(&mock_create_root_signature);  // PC CreateRootSignature
         table[18] = reinterpret_cast<void*>(&mock_queue_get_desc);  // the struct-returning GetDesc, not the generic thunk
         return true;
     }();
@@ -1639,6 +1693,183 @@ int check_console_command_list() {
     return 0;
 }
 
+// ---- The slot-57 record branch: decode -> build -> PC CreateGraphicsPipelineState (docs/graphics_pso.md section 5) ----
+
+// A slot-57 record built by hand (runtime/src/graphics_record.h): the 0x108 bytes of pointer/size pairs, the two blobs
+// the decoder reads (the state envelope and the input layout) and the program / kind-2 stage-blob bytes whose sizes the
+// decoder checks. This test makes every byte; no game data is involved.
+struct Slot57Record {
+    std::uint8_t bytes[rt::graphics_record::kDescriptorValidatedBytes] = {};
+    std::uint8_t state[388] = {};   // inside the measured 380..520-byte state envelope; no word of it is used
+    std::uint8_t layout[117] = {};  // the 80-byte empty layout, with room for the one-element layout
+    std::uint8_t ps_program[128] = {};
+    std::uint8_t vs_program[128] = {};
+    std::uint8_t ps_blob[0x30] = {};  // the kind-2 stage blob's measured envelope, 0x10 + one 32-byte record
+    std::uint8_t vs_blob[0x30] = {};
+
+    Slot57Record() {
+        pair(rt::graphics_record::kStatePairOffset, state, sizeof(state));
+        pair(rt::graphics_record::kInputLayoutPairOffset, layout, 0x50);  // the empty layout: element count 0
+        pair(rt::graphics_record::kStagePairOffset, ps_program, sizeof(ps_program));  // slot 0: PS
+        pair(rt::graphics_record::kStagePairOffset + rt::graphics_record::kProgramToBlobPairOffset, ps_blob,
+             sizeof(ps_blob));
+        pair(rt::graphics_record::kStagePairOffset + rt::graphics_record::kStagePairStride, vs_program,
+             sizeof(vs_program));  // slot 1: VS
+        pair(rt::graphics_record::kStagePairOffset + rt::graphics_record::kStagePairStride +
+                 rt::graphics_record::kProgramToBlobPairOffset,
+             vs_blob, sizeof(vs_blob));
+    }
+
+    void pair(std::size_t at, const void* pointer, std::uint64_t size) {
+        const auto address = reinterpret_cast<std::uint64_t>(pointer);
+        std::memcpy(bytes + at, &address, sizeof(address));
+        std::memcpy(bytes + at + 8, &size, sizeof(size));
+    }
+    void root(void* signature) {
+        const auto value = reinterpret_cast<std::uint64_t>(signature);
+        std::memcpy(bytes + rt::graphics_record::kRootSignatureOffset, &value, sizeof(value));
+    }
+    void layout_size(std::uint64_t size) {
+        std::memcpy(bytes + rt::graphics_record::kInputLayoutPairOffset + 8, &size, sizeof(size));
+    }
+    // A PS+VS record whose input layout names one element: its format code is not mapped to a DXGI format, so the
+    // builder refuses it instead of building an input element description from a guess.
+    void with_element() {
+        const std::uint32_t count = 1;
+        std::memcpy(layout + rt::graphics_record::kInputLayoutCountOffset, &count, sizeof(count));
+        std::memcpy(layout + rt::graphics_record::kInputLayoutNamesOffset, "POSITION", 9);
+        layout_size(rt::graphics_record::kInputLayoutHeaderBytes + 9 +
+                    rt::graphics_record::kInputLayoutAttributeBytes);
+    }
+    // Slot 2 only (a mesh stage): a D3D12_GRAPHICS_PIPELINE_STATE_DESC has no mesh-shader field.
+    void mesh_only() {
+        std::memset(bytes + rt::graphics_record::kStagePairOffset, 0, 2 * rt::graphics_record::kStagePairStride);
+        pair(rt::graphics_record::kStagePairOffset + 2 * rt::graphics_record::kStagePairStride, ps_program,
+             sizeof(ps_program));
+        pair(rt::graphics_record::kStagePairOffset + 2 * rt::graphics_record::kStagePairStride +
+                 rt::graphics_record::kProgramToBlobPairOffset,
+             ps_blob, sizeof(ps_blob));
+    }
+    // A state pair with no size: outside the decoder's measured envelope, so the record does not decode at all.
+    void break_state() { std::memset(bytes + rt::graphics_record::kStatePairOffset + 8, 0, sizeof(std::uint64_t)); }
+};
+
+int check_slot57_graphics_record() {
+    Mock* mock = nullptr;
+    void* device = make_device(mock, 11, true);
+    EXPECT(device != nullptr);
+
+    // A root signature created through the proxy is remembered, and a record's +0x00 is passed on only after that: the
+    // builder keys the PC pipeline on pRootSignature, so an unproved pointer would be called through by the layer.
+    const IID root_iid = __uuidof(ID3D12RootSignature);
+    void* root_signature = nullptr;
+    std::uint8_t root_blob[64] = {};
+    EXPECT(hr_of(raw(device, 16, 1, word(root_blob), sizeof(root_blob), word(&root_iid), word(&root_signature))) == S_OK);
+    EXPECT(root_signature != nullptr && mock->calls[16] == 1);
+    EXPECT(reinterpret_cast<Mock*>(root_signature)->kind == Kind::root_signature);
+
+    const IID pso_iid = __uuidof(ID3D12PipelineState);
+    Slot57Record record;
+    record.root(root_signature);
+    void* pso = nullptr;
+
+    // 1. A record that decodes and builds. The description the proxy hands the PC device carries the record's two
+    //    native programs in their slots, its root signature, the logged attachment stand-in, the documented default
+    //    state and an empty input layout.
+    EXPECT(hr_of(raw(device, 57, word(&record), word(&pso_iid), word(&pso))) == S_OK);
+    const unsigned create_calls = mock->calls[10];
+    EXPECT(create_calls == 1 && pso != nullptr);
+    Mock* const pso_mock = reinterpret_cast<Mock*>(pso);
+    EXPECT(pso_mock->kind == Kind::pipeline_state);
+    // The forwarding shape: the title's IID and out pointer reached the PC method (the description is the proxy's own
+    // copy, which the mock took by value).
+    EXPECT(mock->args[10][1] == word(&pso_iid) && mock->args[10][2] == word(&pso));
+    const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc = mock->graphics_desc;
+    EXPECT(desc.pRootSignature == root_signature);
+    EXPECT(desc.PS.pShaderBytecode == record.ps_program && desc.PS.BytecodeLength == sizeof(record.ps_program));
+    EXPECT(desc.VS.pShaderBytecode == record.vs_program && desc.VS.BytecodeLength == sizeof(record.vs_program));
+    EXPECT(!desc.DS.pShaderBytecode && !desc.HS.pShaderBytecode && !desc.GS.pShaderBytecode);
+    EXPECT(desc.StreamOutput.NumEntries == 0 && desc.InputLayout.NumElements == 0 && !desc.InputLayout.pInputElementDescs);
+    EXPECT(desc.NumRenderTargets == 1 && desc.RTVFormats[0] == DXGI_FORMAT_R8G8B8A8_UNORM &&
+           desc.RTVFormats[1] == DXGI_FORMAT_UNKNOWN && desc.DSVFormat == DXGI_FORMAT_UNKNOWN);
+    EXPECT(desc.SampleDesc.Count == 1 && desc.SampleDesc.Quality == 0 && desc.SampleMask == 0xffffffffu);
+    EXPECT(desc.PrimitiveTopologyType == D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE);
+    EXPECT(desc.RasterizerState.FillMode == D3D12_FILL_MODE_SOLID &&
+           desc.RasterizerState.CullMode == D3D12_CULL_MODE_BACK && desc.RasterizerState.DepthClipEnable == TRUE);
+    EXPECT(desc.BlendState.RenderTarget[0].BlendEnable == FALSE && desc.DepthStencilState.DepthEnable == FALSE);
+    EXPECT(desc.NodeMask == 0 && desc.Flags == D3D12_PIPELINE_STATE_FLAG_NONE);
+    EXPECT(release(pso) == 0 && pso_mock->refs == 0);
+
+    // 2. The record may name the root signature through a title-side slot: accepted because the value inside is the PC
+    //    object this device handed out (the mapping is proved against the root-signature table, not guessed).
+    void* root_holder = root_signature;
+    record.root(&root_holder);
+    pso = nullptr;
+    EXPECT(hr_of(raw(device, 57, word(&record), word(&pso_iid), word(&pso))) == S_OK);
+    EXPECT(mock->calls[10] == create_calls + 1 && mock->graphics_desc.pRootSignature == root_signature);
+    EXPECT(pso != nullptr && release(pso) == 0);
+    record.root(root_signature);
+
+    // 3. A record whose input layout has an element is refused by input_layout.elements[0].format (E_NOTIMPL: the
+    //    format mapping is the decode this tree has not done). Nothing reaches the PC device.
+    {
+        Slot57Record elements;
+        elements.root(root_signature);
+        elements.with_element();
+        pso = nullptr;
+        EXPECT(hr_of(raw(device, 57, word(&elements), word(&pso_iid), word(&pso))) == E_NOTIMPL);
+        EXPECT(pso == nullptr && mock->calls[10] == create_calls + 1);
+    }
+
+    // 4. A mesh stage cannot be expressed in a D3D12_GRAPHICS_PIPELINE_STATE_DESC: refused as E_NOTIMPL, nothing sent.
+    {
+        Slot57Record mesh;
+        mesh.root(root_signature);
+        mesh.mesh_only();
+        pso = nullptr;
+        EXPECT(hr_of(raw(device, 57, word(&mesh), word(&pso_iid), word(&pso))) == E_NOTIMPL);
+        EXPECT(pso == nullptr && mock->calls[10] == create_calls + 1);
+    }
+
+    // 5. A record with no root signature is refused by name (record.root_signature) before the caller's inputs are
+    //    reached; an untracked non-null pointer is refused as pRootSignature rather than passed to the layer.
+    {
+        Slot57Record no_root;
+        pso = nullptr;
+        EXPECT(hr_of(raw(device, 57, word(&no_root), word(&pso_iid), word(&pso))) == E_INVALIDARG);
+        std::uint64_t untracked = 0;
+        no_root.root(&untracked);
+        EXPECT(hr_of(raw(device, 57, word(&no_root), word(&pso_iid), word(&pso))) == E_INVALIDARG);
+        EXPECT(pso == nullptr && mock->calls[10] == create_calls + 1);
+    }
+
+    // 6. A record that does not decode is refused before the builder: the title's description is outside the measured
+    //    shape, and no input is invented for it.
+    {
+        Slot57Record broken;
+        broken.root(root_signature);
+        broken.break_state();
+        pso = nullptr;
+        EXPECT(hr_of(raw(device, 57, word(&broken), word(&pso_iid), word(&pso))) == E_INVALIDARG);
+        EXPECT(pso == nullptr && mock->calls[10] == create_calls + 1);
+    }
+
+    // 7. A failed PC call comes back unchanged, with no object: the branch forwards the real HRESULT, it does not
+    //    answer success for a pipeline the device refused.
+    mock->create_result = E_FAIL;
+    pso = nullptr;
+    EXPECT(hr_of(raw(device, 57, word(&record), word(&pso_iid), word(&pso))) == E_FAIL);
+    EXPECT(pso == nullptr && mock->calls[10] == create_calls + 2);
+    mock->create_result = S_OK;
+
+    EXPECT(release(device) == 0 && mock->refs == 0);
+    std::printf("%s: the slot-57 record branch decodes through the real graphics_record/graphics_pso layer, sends the "
+                "built description to PC CreateGraphicsPipelineState with the title's IID and out pointer, passes the "
+                "record's root signature only when this device handed it out, and refuses an element input layout, a "
+                "mesh stage, a missing or untracked root signature and a malformed record by name\n", g_label);
+    return 0;
+}
+
 int main(int argc, char** argv) {
     no_dialogs();
     std::setvbuf(stdout, nullptr, _IONBF, 0);
@@ -1654,7 +1885,7 @@ int main(int argc, char** argv) {
     if (argc != 1) return 2;
     if (check_tail(true) || check_queue_console_slots() || check_levels() || check_fence1() ||
         check_create_failures() || check_open_shared() || check_alloc_failures() || check_allocators() ||
-        check_xbox_slots() || check_console_command_list())
+        check_xbox_slots() || check_console_command_list() || check_slot57_graphics_record())
         return 1;
     std::printf("xs_proxy_mock_test: PASS (%d allocations refused on purpose)\n", g_failed_news);
     return 0;
