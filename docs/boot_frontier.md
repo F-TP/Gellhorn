@@ -378,22 +378,3 @@ argument from `[rsi+0x60]`, and the first qword there is zero.
 
 This is also a policy question for `LEONIDA_SKIP_INT3`: for a trap that follows a null check, stopping at the trap is more
 informative than stepping over it, because the trap site is the title's own statement of what went wrong.
-
-
-## Frontier 2026-11-24 (new stop): a null argument that the title traps on
-
-After the slot 18 fix the stop is `game+0xcc2861`, `test byte ptr [rdi+0x10], 4` reading `0x10`. Instrumented pokes show
-the routine is entered with a valid pointer on every early pass (`rdi` = a heap pointer), so this is not a state problem
-inside the routine: the faulting pass is the one that enters with a null argument.
-
-The routine begins by testing its first argument and branching to `game+0xcc2936` when it is null. That address is an
-`int3`, and `game+0xcc2937` is a `jmp` back to the loop body that skips the argument load. `LEONIDA_SKIP_INT3` steps over
-that `int3`, so the null argument then reaches `[rdi+0x10]` and faults at `0x10`. The trace records exactly this:
-`int3_skipped at game+0xcc2936` is the last skip before the fault.
-
-So the title's own null check fired, and skipping the trap converted a deliberate stop into a dereference. The question to
-answer next is who passed the null: the caller frame is `game+0x186324`, whose `mov rcx, qword ptr [rax]` loads the
-argument from `[rsi+0x60]`, and the first qword there is zero.
-
-This is also a policy question for `LEONIDA_SKIP_INT3`: for a trap that follows a null check, stopping at the trap is more
-informative than stepping over it, because the trap site is the title's own statement of what went wrong.
