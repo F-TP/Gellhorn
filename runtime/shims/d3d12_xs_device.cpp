@@ -43,6 +43,23 @@ extern "C" void leonida_register_console_heap(void* fn) {
     rt::d3d12::console_heap_slot() = reinterpret_cast<rt::d3d12::CreateConsoleHeapFn>(fn);
 }
 
+// The graphics stand-in creator lives in d3d12_vulkan_device.cpp, which the GPU-free test binaries do not link
+// either; it registers here at startup the same way. Console device slot 57 calls it after its record probe, and the
+// creator itself checks LEONIDA_STANDIN_PIPELINES (answering E_NOTIMPL with the switch off), so a boot without the
+// switch keeps the probe's refusal exactly.
+namespace rt::d3d12 {
+using CreateGraphicsStandinFn = HRESULT(WINAPI*)(ID3D12Device*, REFIID, void**);
+inline CreateGraphicsStandinFn& graphics_standin_slot() {
+    static CreateGraphicsStandinFn fn = nullptr;
+    return fn;
+}
+}  // namespace rt::d3d12
+
+// Called by d3d12_vulkan_device.cpp's static initializer.
+extern "C" void leonida_register_graphics_standin(void* fn) {
+    rt::d3d12::graphics_standin_slot() = reinterpret_cast<rt::d3d12::CreateGraphicsStandinFn>(fn);
+}
+
 
 
 #include "../src/shader_library.h"  // leonida::fspx_payload_from_parts for slot 67
@@ -1736,11 +1753,11 @@ HRESULT proxy_create_compute_pipeline_state(DeviceProxy* self, const D3D12_COMPU
 // slot 67's DeserializeComputePipelineStateX: it creates a pipeline state from a precompiled record, with two
 // (program, stage blob) pairs in slot order (slot 0 the pixel shader, slot 1 the vertex shader). The probe logs per pair
 // the size, the prefix, whether it is a native kind-6 program whose SHA-256 the shader index keys it by, and for a blob
-// its tag offsets, digest and printable names, then refuses: no resolver for those records exists yet.
+// its tag offsets, digest and printable names, then refuses: no resolver for those records exists yet. With
+// LEONIDA_STANDIN_PIPELINES on it hands over a real stand-in graphics pipeline instead (see the end of this function).
 // The trace line per call is not part of the conversion: this slot used to be forwarded to a PC method that recorded
 // one, and the boot's D3D12 call count is compared across trees, so the probe must record the call too.
 HRESULT proxy_create_graphics_pipeline_probe(DeviceProxy* self, const void* desc, const IID* riid, void** out) {
-    (void)self;
     note_slot(57);
     // Past the public device chain the slot has no PC name, so it is named by index, as a child slot past its chain is
     // ("XboxID3D12CommandQueue::Slot40"); d3d12_trace::record takes a fixed string (runtime/README.md, [d3d12-trace]).
@@ -1895,6 +1912,50 @@ HRESULT proxy_create_graphics_pipeline_probe(DeviceProxy* self, const void* desc
                          tags.empty() ? "none" : tags.c_str(), digest.empty() ? "none" : digest.c_str(), zero_tail,
                          names.empty() ? "none" : names.c_str());
         }
+    }
+    // The record has no converter yet (runtime/src/graphics_record.h decodes it, but the fixed-function state blob and
+    // the input layout's formats are still unknown), so the slot refuses and the title gets a null PSO. With
+    // LEONIDA_STANDIN_PIPELINES on, the Vulkan device hands the title a real graphics pipeline built from this
+    // project's own VS+PS pair instead (d3d12_vulkan_device.cpp, create_standin_graphics_pipeline), which measures
+    // whether this refusal is what stops the boot. The creator answers E_NOTIMPL with the switch off, so that boot is
+    // unchanged. Diagnostic only: the stand-in's draws do not do the record's work.
+    if (const auto create_standin = rt::d3d12::graphics_standin_slot()) {
+        // The record's stage count (the measured slots are 0 PS, 1 VS, 2 MS: docs/graphics_record.md section 1),
+        // reported on the stand-in lines so a reader can tell the shape that was stood in for.
+        unsigned stage_count = 0;
+        const auto* record = static_cast<const std::uint8_t*>(desc);
+        for (int slot = 0; slot < 3; ++slot) {
+            const std::size_t at = 0x28 + 0x20 * std::size_t(slot);
+            std::uint64_t address = 0, size = 0;
+            if (!readable_range(record + at, sizeof(address) + sizeof(size))) continue;
+            std::memcpy(&address, record + at, sizeof(address));
+            std::memcpy(&size, record + at + sizeof(address), sizeof(size));
+            if (address && size) ++stage_count;
+        }
+        const HRESULT standin = create_standin(self->real, *riid, out);
+        if (SUCCEEDED(standin) && *out) {
+            static std::atomic<std::uint64_t> standin_count{0};
+            const std::uint64_t count = standin_count.fetch_add(1, std::memory_order_relaxed) + 1;
+            // The explanation is capped like the compute stand-in's; the counter line is not, so the last line before
+            // the next stop gives the exact number of stand-ins the boot took.
+            if (count <= 3)
+                std::fprintf(stderr,
+                             "[rt] d3d12_xs: STAND-IN graphics pipeline #%llu (record stage count %u): the slot-57 "
+                             "record has no converter yet, so a pipeline built from this project's own VS+PS pair is "
+                             "handed over; its draws will not do the record's work\n",
+                             static_cast<unsigned long long>(count), stage_count);
+            else
+                std::fprintf(stderr, "[rt] d3d12_xs: STAND-IN graphics pipeline #%llu (record stage count %u)\n",
+                             static_cast<unsigned long long>(count), stage_count);
+            return standin;
+        }
+        static std::atomic<int> standin_failures{0};
+        if (standin_failures.fetch_add(1, std::memory_order_relaxed) < 3)
+            std::fprintf(stderr,
+                         "[rt] d3d12_xs: slot 57 graphics stand-in not created (0x%08lx, record stage count %u); the "
+                         "slot refuses as before\n",
+                         static_cast<unsigned long>(standin), stage_count);
+        *out = nullptr;
     }
     return E_NOTIMPL;
 }

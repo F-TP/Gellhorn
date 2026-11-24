@@ -1707,6 +1707,72 @@ inline bool standin_pipelines() {
     return on;
 }
 
+// The VS+PS pair the graphics stand-in is built from: console device slot 57 creates a graphics pipeline from a
+// deserialized record this tree cannot convert yet, so with LEONIDA_STANDIN_PIPELINES on it hands the title a real
+// graphics pipeline built from this pair instead of a null PSO (create_standin_graphics_pipeline at the end of this
+// file). The pair is this project's own: the empty-interface partner stubs tools/spirv_stubs.py emits for the
+// translator's pipeline-check tests (there as SPIR-V 1.0), embedded here as words so a stand-in needs no shader
+// directory, no library entry and no game data - a vertex shader writing BuiltIn Position and a fragment shader
+// writing Location 0. Diagnostic only: the stand-in's draws do not do the record's work.
+inline constexpr std::uint32_t kStandinVsSpirv[] = {
+    0x07230203u, 0x00010000u, 0x00000000u, 0x0000000du,
+    0x00000000u, 0x00020011u, 0x00000001u, 0x0003000eu,
+    0x00000000u, 0x00000001u, 0x0006000fu, 0x00000000u,
+    0x0000000bu, 0x6e69616du, 0x00000000u, 0x0000000au,
+    0x00040047u, 0x0000000au, 0x0000000bu, 0x00000000u,
+    0x00020013u, 0x00000001u, 0x00030021u, 0x00000002u,
+    0x00000001u, 0x00030016u, 0x00000003u, 0x00000020u,
+    0x00040017u, 0x00000004u, 0x00000003u, 0x00000004u,
+    0x00040020u, 0x00000005u, 0x00000003u, 0x00000004u,
+    0x0004002bu, 0x00000003u, 0x00000006u, 0x00000000u,
+    0x0004002bu, 0x00000003u, 0x00000007u, 0x3f800000u,
+    0x0007002cu, 0x00000004u, 0x00000008u, 0x00000006u,
+    0x00000006u, 0x00000006u, 0x00000007u, 0x0007002cu,
+    0x00000004u, 0x00000009u, 0x00000006u, 0x00000006u,
+    0x00000006u, 0x00000006u, 0x0004003bu, 0x00000005u,
+    0x0000000au, 0x00000003u, 0x00050036u, 0x00000001u,
+    0x0000000bu, 0x00000000u, 0x00000002u, 0x000200f8u,
+    0x0000000cu, 0x0003003eu, 0x0000000au, 0x00000008u,
+    0x000100fdu, 0x00010038u,
+};
+inline constexpr std::uint32_t kStandinPsSpirv[] = {
+    0x07230203u, 0x00010000u, 0x00000000u, 0x0000000bu,
+    0x00000000u, 0x00020011u, 0x00000001u, 0x0003000eu,
+    0x00000000u, 0x00000001u, 0x0006000fu, 0x00000004u,
+    0x00000009u, 0x6e69616du, 0x00000000u, 0x00000008u,
+    0x00030010u, 0x00000009u, 0x00000007u, 0x00040047u,
+    0x00000008u, 0x0000001eu, 0x00000000u, 0x00020013u,
+    0x00000001u, 0x00030021u, 0x00000002u, 0x00000001u,
+    0x00030016u, 0x00000003u, 0x00000020u, 0x00040017u,
+    0x00000004u, 0x00000003u, 0x00000004u, 0x00040020u,
+    0x00000005u, 0x00000003u, 0x00000004u, 0x0004002bu,
+    0x00000003u, 0x00000006u, 0x00000000u, 0x0007002cu,
+    0x00000004u, 0x00000007u, 0x00000006u, 0x00000006u,
+    0x00000006u, 0x00000006u, 0x0004003bu, 0x00000005u,
+    0x00000008u, 0x00000003u, 0x00050036u, 0x00000001u,
+    0x00000009u, 0x00000000u, 0x00000002u, 0x000200f8u,
+    0x0000000au, 0x0003003eu, 0x00000008u, 0x00000007u,
+    0x000100fdu, 0x00010038u,
+};
+
+// The stand-in module for one graphics stage name; empty for a stage the stand-in does not cover.
+inline const std::vector<std::uint32_t>& standin_stage_words(const char* name) {
+    static const std::vector<std::uint32_t> vs(std::begin(kStandinVsSpirv), std::end(kStandinVsSpirv));
+    static const std::vector<std::uint32_t> ps(std::begin(kStandinPsSpirv), std::end(kStandinPsSpirv));
+    static const std::vector<std::uint32_t> none;
+    if (name && std::strcmp(name, "vs") == 0) return vs;
+    if (name && std::strcmp(name, "ps") == 0) return ps;
+    return none;
+}
+
+// The library entry a stand-in stage reports: default-constructed, so it has no bindings, literal samplers, input
+// signature, subgroup request or f16 halves. The rest of create_graphics then handles a stand-in stage exactly like a
+// translated one, without a library record (which matters when the shader directory failed to load).
+inline const leonida::ShaderEntry& standin_entry() {
+    static const leonida::ShaderEntry entry;
+    return entry;
+}
+
 // Map a pagefile-backed section over [address, address+size) at that exact address, one 64 KiB page at a time.
 // Returns the address when every page was mapped, null otherwise.
 inline void* console_heap_back(std::uint64_t address, SIZE_T size) {
@@ -3497,8 +3563,11 @@ public:
     // With `ms` (a pipeline state stream's MS subobject) it is an MS (+ PS) pipeline on VK_EXT_mesh_shader instead:
     // no VS, no vertex input or input assembly (the input layout, topology type and strip cut are ignored, as D3D12
     // does for mesh PSOs), drawn by DispatchMesh. An AS (amplification shader) is refused: the game has none.
+    // `standin` is the diagnostic graphics stand-in (LEONIDA_STANDIN_PIPELINES, create_standin_graphics_pipeline): the
+    // stages are the project's own kStandinVsSpirv/kStandinPsSpirv pair instead of a library translation, and no
+    // shader library is needed. Set only by that entry point.
     HRESULT create_graphics(const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc, const D3D12_SHADER_BYTECODE* ms = nullptr,
-                            const D3D12_SHADER_BYTECODE* as = nullptr) {
+                            const D3D12_SHADER_BYTECODE* as = nullptr, bool standin = false) {
         auto& vk = device_.context->vk;
         const VkDevice dev = device_.info.device;
         const bool mesh = ms && ms->pShaderBytecode && ms->BytecodeLength;
@@ -3593,7 +3662,9 @@ public:
             return E_INVALIDARG;
         }
         const leonida::ShaderLibrary* library = device_.library();
-        if (!library) return E_FAIL;
+        // A stand-in stage carries its module in the table, so it needs no library: a shader directory that failed to
+        // load must answer with stand-ins and refusals, not abort the pipeline path.
+        if (!library && !standin) return E_FAIL;
 
         struct Stage {
             const char* name;
@@ -3635,8 +3706,21 @@ public:
             stage.fssm = leonida::fssm_program(
                 {static_cast<const std::uint8_t*>(stage.code.pShaderBytecode), stage.code.BytecodeLength});
             if (stage.fssm.empty()) {
-                log_once("shader bytecode holds no FSSM program; bytes", int(stage.code.BytecodeLength));
-                return E_INVALIDARG;
+                // The graphics stand-in's own module (see create_standin_graphics_pipeline): no library record and no
+                // library lookup at all. `continue` skips the per-entry handling below (bindings, mesh limits, code
+                // base, f16 halves, writable storage) - none of it applies to the default entry.
+                if (!standin) {
+                    log_once("shader bytecode holds no FSSM program; bytes", int(stage.code.BytecodeLength));
+                    return E_INVALIDARG;
+                }
+                const std::vector<std::uint32_t>& words = standin_stage_words(stage.name);
+                if (words.empty()) {
+                    log_once("the graphics stand-in has a VS+PS pair only; stage", int(stage.bit));
+                    return E_NOTIMPL;
+                }
+                stage.words = words;
+                stage.entry = &standin_entry();
+                continue;
             }
             const std::string hash = leonida::sha256_hex(stage.fssm);
             // Containers with the same program can differ in their input signature or bindings: a VS must have its
@@ -10167,6 +10251,52 @@ HRESULT create_console_descriptor_heap(ID3D12Device* device, const D3D12_DESCRIP
     return hand_out(heap, riid, out);
 }
 
+// Console device slot 57 (runtime/shims/d3d12_xs_device.cpp) creates a graphics pipeline from a deserialized record
+// (runtime/src/graphics_record.h) that this tree cannot convert yet: the fixed-function state blob and the input
+// layout's formats are undecoded, so the slot refuses and the title gets a null PSO. With LEONIDA_STANDIN_PIPELINES
+// on, the slot hands the title a real graphics pipeline built from this project's own VS+PS pair instead - the same
+// create_graphics path a translated pipeline takes, with the defaults below - so one boot can measure whether that
+// refusal is what stops it. Diagnostic only: the stand-in's draws do not do the record's work. It needs no shader
+// library, so it also answers when the shader directory failed to load.
+HRESULT create_standin_graphics_pipeline(ID3D12Device* device, REFIID riid, void** out) {
+    if (out) *out = nullptr;
+    if (!device || !out) return E_POINTER;
+    if (!standin_pipelines()) return E_NOTIMPL;  // the switch is the only way in; off keeps slot 57's refusal
+    ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
+    Device* d = Device::from<Device>(real ? real : device);
+    if (!d) return E_NOTIMPL;  // not the Vulkan-backed device: nothing here can build a stand-in
+    // The fixed-function state is unknown (runtime/src/graphics_record.h, "The fixed-function state blob"), so these
+    // are documented defaults, not measured values: one R8G8B8A8_UNORM render target, no depth-stencil, blending off,
+    // sample count 1, triangle list, solid fill, back-face culling, depth clipping on. The caller logs every use.
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC desc{};
+    desc.VS = {kStandinVsSpirv, sizeof(kStandinVsSpirv)};
+    desc.PS = {kStandinPsSpirv, sizeof(kStandinPsSpirv)};
+    desc.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    desc.SampleMask = UINT_MAX;
+    desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    desc.RasterizerState.CullMode = D3D12_CULL_MODE_BACK;
+    desc.RasterizerState.FrontCounterClockwise = FALSE;
+    desc.RasterizerState.DepthClipEnable = TRUE;
+    desc.RasterizerState.ConservativeRaster = D3D12_CONSERVATIVE_RASTERIZATION_MODE_OFF;
+    desc.DepthStencilState.DepthEnable = FALSE;
+    desc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+    desc.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
+    desc.DepthStencilState.StencilEnable = FALSE;
+    desc.DSVFormat = DXGI_FORMAT_UNKNOWN;
+    desc.NumRenderTargets = 1;
+    desc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    desc.SampleDesc.Count = 1;
+    desc.SampleDesc.Quality = 0;
+    auto* pipeline = new PipelineState(const_cast<DeviceState&>(d->state()));
+    pipeline->attach_device(d->holder());
+    if (const HRESULT hr = pipeline->create_graphics(desc, nullptr, nullptr, /*standin=*/true); FAILED(hr)) {
+        pipeline->Release();
+        return hr;
+    }
+    return hand_out(pipeline, riid, out);
+}
+
 extern "C" void leonida_register_console_heap(void* fn);
 
 // Hand the console descriptor-heap entry point to the device proxy (runtime/shims/d3d12_xs_device.cpp). It cannot
@@ -10178,6 +10308,18 @@ struct ConsoleHeapRegistration {
         leonida_register_console_heap(reinterpret_cast<void*>(&create_console_descriptor_heap));
     }
 } g_console_heap_registration;
+}  // namespace
+
+extern "C" void leonida_register_graphics_standin(void* fn);
+
+// The same hand-off for the graphics stand-in: the device proxy calls it from console slot 57, and the switch is
+// checked here so a boot without LEONIDA_STANDIN_PIPELINES is byte-identical in behaviour to the baseline.
+namespace {
+struct GraphicsStandinRegistration {
+    GraphicsStandinRegistration() {
+        leonida_register_graphics_standin(reinterpret_cast<void*>(&create_standin_graphics_pipeline));
+    }
+} g_graphics_standin_registration;
 }  // namespace
 
 std::filesystem::path configured_shader_directory(std::string* error, const std::filesystem::path& config) {
