@@ -88,9 +88,9 @@
     "detail_doc": "docs/boot_frontier.md"
   },
   "next": [
+    "test a graphics PSO stand-in behind LEONIDA_STANDIN_PIPELINES: does the title get past the null container, or does it need real pipelines? (XCL builds pipelines non-blockingly and hands out stand-ins at once)",
     "publish the pipeline library's graphics programs into the shader index (61 of its entries are in it today, all compute)",
-    "add a native-program branch to the graphics stage loop and decode the record's state and input-layout blobs",
-    "refresh this block with `python -I tools/readme_progress.py` after each measured change"
+    "add a native-program branch to the graphics stage loop and decode the record's state and input-layout blobs"
   ],
   "links": [
     {

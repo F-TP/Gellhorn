@@ -46,9 +46,9 @@ clean-room approach, plus the boot fixes measured on this machine.
 Measurements and the method behind them: [docs/boot_frontier.md](docs/boot_frontier.md).
 
 Next up:
+- test a graphics PSO stand-in behind LEONIDA_STANDIN_PIPELINES: does the title get past the null container, or does it need real pipelines? (XCL builds pipelines non-blockingly and hands out stand-ins at once)
 - publish the pipeline library's graphics programs into the shader index (61 of its entries are in it today, all compute)
 - add a native-program branch to the graphics stage loop and decode the record's state and input-layout blobs
-- refresh this block with `python -I tools/readme_progress.py` after each measured change
 
 More: [the full measurement ladder](docs/boot_frontier.md), [the null-object chain trace](docs/null_object_chain.md), [how the other public attempt is built](docs/competitor_intel.md), [incoming reports and tracked findings](docs/issues.md).
 
