@@ -1,0 +1,71 @@
+{
+  "updated": "2026-11-24",
+  "commit": "d8229b5b1",
+  "intro": "Measured on one machine (Windows 11, Intel 13900K, RTX 4090) against a retail Xbox Series 1.0.2.1 package. Every row below is an outcome the project produces, not a plan; the commands that produce them are in the Build section, and the failures behind each number are in docs/boot_frontier.md.",
+  "stages": [
+    {
+      "stage": "Image and platform",
+      "state": "done",
+      "evidence": "the title's PE32+ image maps at its preferred base, imports resolve through shims, static TLS is redirected for 53,246 slot-0 reads, heap and file system come from the host"
+    },
+    {
+      "stage": "Shader corpus",
+      "state": "done",
+      "evidence": "26,616 SPIR-V modules indexed from 26,503 carved game modules plus the pipeline library; the pipeline library and FSPX repair are wired into make_game, so a fresh build reproduces the index"
+    },
+    {
+      "stage": "Console D3D12 on Vulkan",
+      "state": "done",
+      "evidence": "device, queues, allocators, descriptor heaps, command lists and pipelines answer on an RTX 4090; the retail boot reaches 11,986 D3D12 calls with 0 pipeline failures and no stand-in pipelines"
+    },
+    {
+      "stage": "Console DirectStorage",
+      "state": "done",
+      "evidence": "factory, file open, zlib decompression; BCPack and swizzled reads still refuse rather than guess"
+    },
+    {
+      "stage": "Boot chain",
+      "state": "in progress",
+      "evidence": "the title gets well past renderer setup and into its own render code; it now stops on a container element it built empty (see the frontier), not on a shim refusal"
+    },
+    {
+      "stage": "Frame loop",
+      "state": "not reached",
+      "evidence": "console frame-event calls are answered, but the title has not yet completed one frame"
+    },
+    {
+      "stage": "Presentation",
+      "state": "not reached",
+      "evidence": "no presented frame yet"
+    },
+    {
+      "stage": "World rendering",
+      "state": "not reached",
+      "evidence": "no world load yet"
+    }
+  ],
+  "counts": [
+    { "what": "D3D12 calls in a retail boot", "value": "11,986" },
+    { "what": "Pipeline creation failures", "value": "0" },
+    { "what": "Carved game shader modules", "value": "26,503" },
+    { "what": "SPIR-V modules indexed", "value": "26,616" },
+    { "what": "FidelityFX pipeline programs translated", "value": "29 / 29" },
+    { "what": "Crash-report frames walked over .pdata", "value": "9 per fault" }
+  ],
+  "frontier": {
+    "stop": "game+0xcc2861",
+    "summary": "a read at 0x10 because a small container element is null: the title builds the container empty and reads its first element as an object pointer, and its own null check then reaches a compiler trap. The next candidate is the 10,242 CreateLifetimeTracker calls that still return E_NOTIMPL.",
+    "detail_doc": "docs/boot_frontier.md"
+  },
+  "next": [
+    "rule in or out ID3D12LifetimeTracker, which the title creates 10,242 times and currently gets back as a null",
+    "follow what should populate the container whose first element is null",
+    "refresh this block with `python -I tools/readme_progress.py` after each measured change"
+  ],
+  "links": [
+    { "what": "the full measurement ladder", "where": "docs/boot_frontier.md" },
+    { "what": "the null-object chain trace", "where": "docs/null_object_chain.md" },
+    { "what": "how the other public attempt is built", "where": "docs/competitor_intel.md" },
+    { "what": "incoming reports and tracked findings", "where": "docs/issues.md" }
+  ]
+}
