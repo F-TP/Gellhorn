@@ -289,3 +289,25 @@ translated library program. The stand-in remains available as a diagnostic but i
 The lesson worth keeping: a refused decompression did not fail loudly at the point of use. It produced valid-looking
 zeros downstream, and three separate investigations spent rounds on "missing programs" that did not exist. When a shim
 refuses a *data* stage, the bytes it feeds every later consumer are wrong, and nothing downstream can tell.
+
+## The null object was console slot 108
+
+The stop that survived the pipeline work was not a pipeline problem at all. Tracing the factory that stores the null
+object showed it creates the engine's default white render-target: the validator accepts the description, then finalize
+asks the device for the resource's allocation info and the allocation fails, so the factory returns null and the renderer
+asserts on it.
+
+The allocation info comes from console device extension slot 108, called in the console's struct-return order - hidden
+16-byte result in RCX, device proxy in RDX, counts in R8/R9, description array on the stack, per-description record array
+as the sixth argument. The shim answered success and wrote at most one zero dword to what it took for an output pointer,
+which for this call is the device proxy, so the return buffer stayed garbage. The title computed a bogus size, asserted
+in its allocator, and the factory returned null.
+
+Answering the slot with a real query - the device's allocation info for the passed description, with a 64 KiB fallback
+when the host cannot size it - removes the stop entirely. Measured: the boot continues past `game+0xCC2861` to
+`game+0x24844A9`, 11,902 D3D12 calls, 0 pipeline failures.
+
+The new stop is the same class one layer on: a global 72-byte-record array (`image+0x75DA668`) is null when an entry is
+written to it. A watcher over that global sees no transition at all during the boot, so whatever populates it never runs;
+no direct store to it exists in the image, so it is filled through a computed pointer, and the next step is to find which
+subsystem's failure skips that initialisation rather than the writer itself.
