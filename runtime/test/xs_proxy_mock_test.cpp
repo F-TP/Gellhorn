@@ -1732,14 +1732,24 @@ struct Slot57Record {
     void layout_size(std::uint64_t size) {
         std::memcpy(bytes + rt::graphics_record::kInputLayoutPairOffset + 8, &size, sizeof(size));
     }
-    // A PS+VS record whose input layout names one element: its format code is not mapped to a DXGI format, so the
-    // builder refuses it instead of building an input element description from a guess.
+    // A PS+VS record whose input layout is the measured element-table form (count at +0x4C, then per element a u32 name
+    // length including the NUL, the name and a 24-byte attribute block, zero-padded to a 4-byte boundary;
+    // docs/input_layout.md) with an UNMEASURED format word (7, i.e. not 2/6/16/28/30): the builder refuses it at
+    // input_layout.elements[0].format[7], so the slot-57 call returns E_NOTIMPL and the boot histogram lists the value.
+    // 0x50 + 4 + 6 ("COLOR") + 24 = 114 bytes, padded to 116, inside this fixture's 117-byte layout buffer.
     void with_element() {
         const std::uint32_t count = 1;
         std::memcpy(layout + rt::graphics_record::kInputLayoutCountOffset, &count, sizeof(count));
-        std::memcpy(layout + rt::graphics_record::kInputLayoutNamesOffset, "POSITION", 9);
-        layout_size(rt::graphics_record::kInputLayoutHeaderBytes + 9 +
-                    rt::graphics_record::kInputLayoutAttributeBytes);
+        const std::uint32_t name_bytes = 6;  // "COLOR" + NUL
+        std::memcpy(layout + rt::graphics_record::kInputLayoutHeaderBytes, &name_bytes, sizeof(name_bytes));
+        std::memcpy(layout + rt::graphics_record::kInputLayoutHeaderBytes +
+                        rt::graphics_record::kInputLayoutNameLengthBytes,
+                    "COLOR", name_bytes);
+        const std::size_t attribute = rt::graphics_record::kInputLayoutHeaderBytes +
+                                      rt::graphics_record::kInputLayoutNameLengthBytes + name_bytes;
+        const std::uint32_t unmeasured_format = 7;
+        std::memcpy(layout + attribute + 4, &unmeasured_format, sizeof(unmeasured_format));
+        layout_size(116);
     }
     // Slot 2 only (a mesh stage): a D3D12_GRAPHICS_PIPELINE_STATE_DESC has no mesh-shader field.
     void mesh_only() {
@@ -1810,8 +1820,9 @@ int check_slot57_graphics_record() {
     EXPECT(pso != nullptr && release(pso) == 0);
     record.root(root_signature);
 
-    // 3. A record whose input layout has an element is refused by input_layout.elements[0].format (E_NOTIMPL: the
-    //    format mapping is the decode this tree has not done). Nothing reaches the PC device.
+    // 3. A record whose input layout element carries an unmeasured format word is refused by
+    //    input_layout.elements[0].format[7] (E_NOTIMPL: the format mapping is the decode this tree has not done for
+    //    that word; the measured words 2/6/16/28/30 do build). Nothing reaches the PC device.
     {
         Slot57Record elements;
         elements.root(root_signature);

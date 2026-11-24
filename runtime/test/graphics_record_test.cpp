@@ -4,12 +4,14 @@
 // every other byte is a pattern this test chose.
 //
 // Covered: a PS+VS record that decodes to the expected spans/offsets; the decoder promises not to read through the
-// record's pointers (a record full of fake pointers still decodes); an 80-byte mesh input layout with no elements;
-// every measured bound (380..520 B state, 80..340 B layout, 52..239,464 B program, 0x10 + 32*k stage blob) on both
-// sides; and the malformed cases: a short descriptor, zero stages, half-set pairs, a non-zero reserved byte, a vertex
-// and mesh stage together, an unterminated or unprintable semantic, a count that contradicts the bytes, a stage blob
-// whose kind, size word, 0x40 head tag, tag order, final 0x43 record or 12 zero bytes disagree. It prints the
-// decoded/unknown field table so the boundary is visible without reading the header.
+// record's pointers (a record full of fake pointers still decodes); an 80-byte mesh input layout with no elements; the
+// measured input-layout element table (count at +0x4C, then per element a u32 name length incl NUL, the name and a
+// 24-byte attribute block, zero-padded to a 4-byte boundary) on all six measured shapes; every measured bound
+// (380..520 B state, 80..340 B layout, 52..239,464 B program, 0x10 + 32*k stage blob) on both sides; and the malformed
+// cases: a short descriptor, zero stages, half-set pairs, a non-zero reserved byte, a vertex and mesh stage together,
+// an input layout whose count, names, lengths, padding or fill are not the measured shape (including the refuted
+// contiguous-names form), a stage blob whose kind, size word, 0x40 head tag, tag order, final 0x43 record or 12 zero
+// bytes disagree. It prints the decoded/unknown field table so the boundary is visible without reading the header.
 
 #include "../src/graphics_record.h"
 
@@ -69,25 +71,66 @@ Bytes make_state_blob() {
     return blob;
 }
 
-// The measured 188-byte shape: count 3 at +0x4C, three NUL-terminated semantics from +0x50 ("POSITION", "COLOR",
-// "TEXCOORD", 24 bytes), then 28 attribute bytes per element. The candidate format codes 6/28/16 and the 0x1C word
-// are placed in the attribute blocks only to show the decoder ignores them: their field encoding is not confirmed.
-Bytes make_input_layout(std::uint32_t count = 3) {
-    Bytes blob(188, 0);
-    put_u32(&blob, 0x4c, count);
-    const char names[] = "POSITION\0COLOR\0TEXCOORD\0";
-    std::memcpy(blob.data() + 0x50, names, sizeof names - 1);
-    const std::uint32_t candidate_formats[3] = {6, 28, 16};
-    const std::size_t attributes = 0x50 + (sizeof names - 1);
-    for (std::size_t element = 0; element < 3; ++element) {
-        const std::size_t at = attributes + element * 28;
-        for (std::size_t word = 0; word < 7; ++word)
-            put_u32(&blob, at + 4 * word, 0x01020304u + 0x10u * static_cast<std::uint32_t>(element) +
-                                                 static_cast<std::uint32_t>(word));
-        put_u32(&blob, at + 4, candidate_formats[element]);
-        put_u32(&blob, at + 0x10, 0x1cu);
+// One element of the measured input-layout table: its printable name and its six attribute words (docs/input_layout.md).
+// Attribute word 1 is the format and word 3 the aligned byte offset in the measured samples; every other word is 0.
+struct LayoutElement {
+    const char* name;
+    std::array<std::uint32_t, rt::graphics_record::kInputLayoutAttributeWords> words;
+};
+
+std::array<std::uint32_t, rt::graphics_record::kInputLayoutAttributeWords> layout_words(std::uint32_t format,
+                                                                                        std::uint32_t offset,
+                                                                                        std::uint32_t semantic_index = 0) {
+    std::array<std::uint32_t, rt::graphics_record::kInputLayoutAttributeWords> words{};
+    words[0] = semantic_index;
+    words[1] = format;
+    words[3] = offset;
+    return words;
+}
+
+// A blob in the measured shape: the element count at +0x4C, then one record per element (a u32 name length including
+// the NUL, the name bytes and a 24-byte attribute block), then zero padding to a 4-byte boundary. The measured sizes
+// are 80 (count 0), 120/1, 152/2, 156/2, 188/3 and 224/4.
+Bytes make_input_layout(std::initializer_list<LayoutElement> elements) {
+    std::size_t size = rt::graphics_record::kInputLayoutHeaderBytes;
+    for (const LayoutElement& element : elements)
+        size += rt::graphics_record::kInputLayoutNameLengthBytes + std::strlen(element.name) + 1 +
+                rt::graphics_record::kInputLayoutAttributeBytes;
+    size = (size + 3) & ~std::size_t{3};
+    Bytes blob(size, 0);
+    put_u32(&blob, rt::graphics_record::kInputLayoutCountOffset, static_cast<std::uint32_t>(elements.size()));
+    std::size_t at = rt::graphics_record::kInputLayoutHeaderBytes;
+    for (const LayoutElement& element : elements) {
+        const std::uint32_t name_bytes = static_cast<std::uint32_t>(std::strlen(element.name)) + 1;
+        put_u32(&blob, at, name_bytes);
+        at += rt::graphics_record::kInputLayoutNameLengthBytes;
+        std::memcpy(blob.data() + at, element.name, name_bytes);
+        at += name_bytes;
+        for (std::size_t word = 0; word < element.words.size(); ++word) put_u32(&blob, at + 4 * word, element.words[word]);
+        at += rt::graphics_record::kInputLayoutAttributeBytes;
     }
     return blob;
+}
+
+// The measured shapes, with the measured format words and the packed offsets they imply:
+Bytes make_layout_120() {  // one element: POSITION, float3 at 0
+    return make_input_layout({{"POSITION", layout_words(6, 0)}});
+}
+Bytes make_layout_152() {  // POSITION float3 at 0, COLOR U8x4 at 12
+    return make_input_layout({{"POSITION", layout_words(6, 0)}, {"COLOR", layout_words(28, 12)}});
+}
+Bytes make_layout_156() {  // TEXCOORD float2 at 0, POSITION float2 at 8
+    return make_input_layout({{"TEXCOORD", layout_words(16, 0)}, {"POSITION", layout_words(16, 8)}});
+}
+Bytes make_layout_188() {  // POSITION float3 at 0, COLOR U8x4 at 12, TEXCOORD float2 at 16
+    return make_input_layout(
+        {{"POSITION", layout_words(6, 0)}, {"COLOR", layout_words(28, 12)}, {"TEXCOORD", layout_words(16, 16)}});
+}
+Bytes make_layout_224() {  // COLOR0 U8x4 at 0, TEXCOORD float2 at 4, POSITION float2 at 12, COLOR2 U8x4 at 20
+    return make_input_layout({{"COLOR", layout_words(28, 0)},
+                              {"TEXCOORD", layout_words(16, 4)},
+                              {"POSITION", layout_words(16, 12)},
+                              {"COLOR", layout_words(30, 20, 2)}});
 }
 
 // Synthetic native-program bytes (not a shader): a repeating pattern of the requested size.
@@ -122,7 +165,7 @@ Bytes make_stage_blob(const std::vector<std::uint32_t>& tags, std::uint8_t diges
 
 struct Fixture {
     Bytes state = make_state_blob();
-    Bytes layout = make_input_layout();
+    Bytes layout = make_layout_188();
     Bytes ps_program = make_program(96, 0x11);
     Bytes ps_blob = make_stage_blob({0x41, 0x42, 0x43}, 1);
     Bytes vs_program = make_program(52, 0x22);
@@ -251,71 +294,115 @@ void test_state() {
 }
 
 void test_input_layout() {
+    // The measured 188-byte shape: the count at +0x4C, elements from +0x50, each a u32 name length including the NUL,
+    // the name bytes and a 24-byte attribute block; no padding (80 + 37 + 34 + 37 = 188).
     const Fixture fixture;
     std::vector<Element> elements;
     check(rt::graphics_record::decode_input_layout(Span{fixture.layout.data(), fixture.layout.size()}, &elements),
-          "layout: the synthetic 188-byte layout decodes");
+          "layout: the synthetic 188-byte measured shape decodes");
     check(elements.size() == 3, "layout: three elements are decoded");
-    check(elements[0].semantic == "POSITION" && elements[1].semantic == "COLOR" && elements[2].semantic == "TEXCOORD",
-          "layout: the NUL-terminated semantics are decoded in order");
-    bool all_unknown = true;
-    const std::uint32_t candidates[3] = {6, 28, 16};
-    for (std::size_t index = 0; index < elements.size(); ++index) {
-        const Element& element = elements[index];
-        all_unknown = all_unknown && !element.semantic_index && !element.format && !element.input_slot &&
-                      !element.aligned_byte_offset && !element.per_vertex_data;
-        // The candidate codes sit in the raw bytes of this synthetic blob; they must not come back as decoded fields.
-        all_unknown = all_unknown && element.attribute[4] == candidates[index];
+    check(elements.size() == 3 && elements[0].semantic == "POSITION" && elements[1].semantic == "COLOR" &&
+              elements[2].semantic == "TEXCOORD",
+          "layout: the length-prefixed semantics are decoded in element order");
+    check(elements.size() == 3 && elements[0].semantic_offset == 0x54 && elements[1].semantic_offset == 0x79 &&
+              elements[2].semantic_offset == 0x9B,
+          "layout: the name offsets are the measured +0x54/+0x79/+0x9B");
+    check(elements.size() == 3 && elements[0].name_bytes == 9 && elements[1].name_bytes == 6 &&
+              elements[2].name_bytes == 9,
+          "layout: the stored length words include the NUL terminator");
+    const std::uint32_t formats[3] = {6, 28, 16};
+    const std::uint32_t offsets[3] = {0, 12, 16};
+    bool attributes = elements.size() == 3;
+    for (std::size_t index = 0; attributes && index < elements.size(); ++index) {
+        for (std::size_t word = 0; word < elements[index].attribute.size(); ++word) {
+            const std::uint32_t expected = word == 1 ? formats[index] : word == 3 ? offsets[index] : 0;
+            attributes = attributes && elements[index].attribute[word] == expected;
+        }
     }
-    check(all_unknown, "layout: format/slot/offset/class/index stay unknown, raw attribute bytes are kept");
-    for (std::size_t element = 0; element < elements.size(); ++element) {
-        check(std::memcmp(elements[element].attribute.data(), fixture.layout.data() + 0x68 + element * 28, 28) == 0,
-              "layout: the 28 attribute bytes are kept verbatim");
+    check(attributes, "layout: the six attribute words are kept verbatim (word 1 the format, word 3 the offset)");
+
+    // Every measured shape decodes, and its size is the element records plus zero padding to a 32-bit boundary.
+    const Bytes shapes[] = {make_layout_120(), make_layout_152(), make_layout_156(), make_layout_188(),
+                            make_layout_224()};
+    const std::size_t shape_elements[] = {1, 2, 2, 3, 4};
+    const std::size_t shape_bytes[] = {120, 152, 156, 188, 224};
+    for (std::size_t shape = 0; shape < 5; ++shape) {
+        std::vector<Element> decoded;
+        check(rt::graphics_record::decode_input_layout(Span{shapes[shape].data(), shapes[shape].size()}, &decoded),
+              "layout: a measured shape decodes");
+        check(decoded.size() == shape_elements[shape] && shapes[shape].size() == shape_bytes[shape],
+              "layout: the measured element count and size are kept");
     }
 
-    const std::size_t rejected_sizes[2] = {79, 341};
+    // An 80-byte blob is the measured empty layout; it has no records to pad.
+    Bytes empty(80, 0);
+    check(rt::graphics_record::decode_input_layout(Span{empty.data(), empty.size()}, &elements),
+          "layout: an 80-byte empty layout decodes");
+    check(elements.empty(), "layout: the empty layout has no elements");
+
+    // The contiguous-names form the decoder used to accept is not this title's blob: from +0x50 the decoder reads a
+    // length word, and the name bytes are not a valid length-prefixed record, so it refuses rather than pairing a name
+    // with bytes whose encoding is not measured.
+    Bytes contiguous(188, 0);
+    put_u32(&contiguous, 0x4c, 3);
+    std::memcpy(contiguous.data() + 0x50, "POSITION\0COLOR\0TEXCOORD\0", 24);
+    check(!rt::graphics_record::decode_input_layout(Span{contiguous.data(), contiguous.size()}, &elements),
+          "layout: the refuted contiguous-names form is refused");
+
+    // Size envelope and the 32-bit word shape.
+    const std::size_t rejected_sizes[3] = {79, 187, 341};
     for (const std::size_t size : rejected_sizes) {
         Bytes blob(size, 0);
         check(!rt::graphics_record::decode_input_layout(Span{blob.data(), blob.size()}, &elements),
-              "layout: a size outside 80..340 is refused");
+              "layout: a size outside 80..340 or not a whole number of words is refused");
     }
 
-    // count 4 with only three names in the blob: the fourth parse runs into binary attribute bytes.
+    // The count against the bytes: too high runs past the blob, too low leaves the records unfilled.
     Bytes four = fixture.layout;
     put_u32(&four, 0x4c, 4);
     check(!rt::graphics_record::decode_input_layout(Span{four.data(), four.size()}, &elements),
-          "layout: a count with no matching names is refused");
-
-    // count 2 with three names: the leftover bytes do not equal two attribute blocks.
+          "layout: a count above the records the bytes hold is refused");
     Bytes two = fixture.layout;
     put_u32(&two, 0x4c, 2);
     check(!rt::graphics_record::decode_input_layout(Span{two.data(), two.size()}, &elements),
-          "layout: a count that does not match the bytes is refused");
+          "layout: a count below the records the bytes hold is refused");
 
-    // An unterminated last name.
+    // A name without its NUL: POSITION's terminator at +0x5C becomes a printable byte.
     Bytes unterminated = fixture.layout;
-    unterminated[0x67] = 'X';  // the NUL after TEXCOORD
+    unterminated[0x5c] = 'X';
     check(!rt::graphics_record::decode_input_layout(Span{unterminated.data(), unterminated.size()}, &elements),
-          "layout: an unterminated semantic is refused");
+          "layout: a name without its NUL is refused");
 
-    // An unprintable byte inside a name.
+    // An unprintable byte inside a name, and a length word outside the measured bound.
     Bytes binary_name = fixture.layout;
-    binary_name[0x51] = 0x01;
+    binary_name[0x55] = 0x01;
     check(!rt::graphics_record::decode_input_layout(Span{binary_name.data(), binary_name.size()}, &elements),
-          "layout: an unprintable semantic byte is refused");
+          "layout: an unprintable name byte is refused");
+    Bytes zero_length = fixture.layout;
+    put_u32(&zero_length, 0x50, 0);
+    check(!rt::graphics_record::decode_input_layout(Span{zero_length.data(), zero_length.size()}, &elements),
+          "layout: a zero name length is refused");
+    Bytes long_name = fixture.layout;
+    put_u32(&long_name, 0x50, 0xffffffffu);
+    check(!rt::graphics_record::decode_input_layout(Span{long_name.data(), long_name.size()}, &elements),
+          "layout: a name length past the measured bound is refused");
 
-    // One byte more than the measured shape.
-    Bytes longer = fixture.layout;
-    longer.push_back(0);
-    check(!rt::graphics_record::decode_input_layout(Span{longer.data(), longer.size()}, &elements),
-          "layout: trailing bytes that are not attribute blocks are refused");
+    // The padding is part of the shape: it must be inside the 4-byte boundary and zero.
+    Bytes dirty_pad = make_layout_120();
+    dirty_pad.back() = 0x01;
+    check(!rt::graphics_record::decode_input_layout(Span{dirty_pad.data(), dirty_pad.size()}, &elements),
+          "layout: a non-zero padding byte is refused");
+    Bytes slack = fixture.layout;
+    slack.resize(slack.size() + 4);
+    check(!rt::graphics_record::decode_input_layout(Span{slack.data(), slack.size()}, &elements),
+          "layout: bytes after the padding (slack) are refused");
 
-    // count 0 with bytes after the header: those bytes have no element to belong to.
-    Bytes stray(81, 0);
+    // Count 0 with bytes after the header: those bytes have no element to belong to.
+    Bytes stray(84, 0);
     check(!rt::graphics_record::decode_input_layout(Span{stray.data(), stray.size()}, &elements),
-          "layout: a zero count with trailing bytes is refused");
+          "layout: an empty count with trailing bytes is refused");
 
-    // A count that would need more name bytes than the blob has must be refused before it is used.
+    // A count that would need more element records than the envelope can hold is refused before it is used.
     Bytes huge = fixture.layout;
     put_u32(&huge, 0x4c, 0xffffffffu);
     check(!rt::graphics_record::decode_input_layout(Span{huge.data(), huge.size()}, &elements),
@@ -534,15 +621,21 @@ void print_findings() {
          "the whole 388-byte sample, 0x40 word at +0x150 included; no meaning measured"},
         {"fixed-function state", "unknown",
          "rasterizer/blend/depth-stencil/sample/topology: raw words only"},
-        {"InputLayout.element count", "decoded", "u32 at +0x4C (188-byte sample)"},
-        {"InputLayout.semantic", "decoded", "NUL-terminated inline from +0x50, in element order"},
-        {"InputLayout attribute block", "decoded (raw 28 bytes)", "28 bytes per element after the names, verbatim"},
-        {"InputLayout format code", "unknown",
-         "codes 6/28/16 observed; DXGI_FORMAT_R32G32B32_FLOAT / _R8G8B8A8_UNORM / _R32G32_FLOAT are candidates only"},
-        {"InputLayout input slot", "unknown", "attribute field encoding not confirmed"},
-        {"InputLayout aligned byte offset", "unknown", "attribute field encoding not confirmed"},
-        {"InputLayout semantic index", "unknown", "attribute field encoding not confirmed"},
-        {"InputLayout per-vertex flag", "unknown", "attribute field encoding not confirmed"},
+        {"InputLayout.element count", "decoded", "u32 at +0x4C (all six measured shapes, docs/input_layout.md)"},
+        {"InputLayout element table", "decoded",
+         "from +0x50: u32 name length incl NUL, the name, a 24-byte attribute block; zero pad to a 4-byte boundary"},
+        {"InputLayout.semantic", "decoded", "length-prefixed, NUL-terminated printable names in element order"},
+        {"InputLayout attribute block", "decoded, kept verbatim (6 u32 words)",
+         "the D3D12 element fields in order: word 0 SemanticIndex, 1 Format, 2 InputSlot, 3 AlignedByteOffset, "
+         "4 InputSlotClass, 5 InstanceDataStepRate"},
+        {"InputLayout format word", "decoded raw (word 1); DXGI mapping in graphics_pso",
+         "measured 2/6/16/28/30 = R32G32B32A32_FLOAT/R32G32B32_FLOAT/R32G32_FLOAT/R8G8B8A8_UNORM/R8G8B8A8_UINT"},
+        {"InputLayout semantic index", "decoded raw (word 0)",
+         "0 on every one- or two-element sample; 2 on the 224-byte shape's second COLOR (COLOR2)"},
+        {"InputLayout aligned byte offset", "decoded raw (word 3)",
+         "the measured layouts are packed, so it equals the bytes the preceding elements occupy"},
+        {"InputLayout input slot / class / step rate", "decoded raw (words 2, 4, 5)",
+         "0 in every measured element; graphics_pso::build refuses any other value by name"},
         {"StageBlob.kind", "decoded", "u32 at +0x00 == 2 (docs/shader_library.md section 3)"},
         {"StageBlob.declared_size_word", "decoded (relation)", "u32 at +0x04 + 12 == blob size (measured)"},
         {"StageBlob.head_word_08", "unknown (kept raw)", "u32 at +0x08; not decoded"},

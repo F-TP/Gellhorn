@@ -11,11 +11,13 @@
 //     (an FSSM blob, arbitrary bytes, an unknown program's bytes).
 //   - pick_entry(): the binding-free preference and the fits fallback.
 //   - build(): every D3D12_GRAPHICS_PIPELINE_STATE_DESC field from the caller's inputs and the record's proved pieces;
-//     an empty input layout (the mesh shape) is accepted and any element is refused with the field named; a missing
-//     state blob, a missing root signature (the record's and the caller's), a stage without bytes, bytes for a stage
-//     the record does not name, bad attachment lists, a zeroed fixed-function state and a mesh stage are refused, each
-//     with its field named; the fixed-function state is used verbatim (a second, different state changes the
-//     description field for field), so there is no silent default.
+//     an empty input layout (the mesh shape) is accepted; the measured input-layout element table is decoded into
+//     D3D12_INPUT_ELEMENT_DESC entries (formats, semantic index, packed offsets, per-vertex data) and every unmeasured
+//     format word, input slot, class, step rate, offset or duplicate semantic/index is refused with its field and value
+//     named; a missing state blob, a missing root signature (the record's and the caller's), a stage without bytes,
+//     bytes for a stage the record does not name, bad attachment lists, a zeroed fixed-function state and a mesh stage
+//     are refused, each with its field named; the fixed-function state is used verbatim (a second, different state
+//     changes the description field for field), so there is no silent default.
 // It prints the input and refusal tables so the boundary is visible without reading the header.
 
 #include "../src/graphics_pso.h"
@@ -91,25 +93,67 @@ Bytes make_state_blob() {
 // the only input layout build() can turn into a D3D12_INPUT_LAYOUT_DESC today.
 Bytes make_empty_layout() { return Bytes(80, 0); }
 
-// The measured 188-byte shape with three elements: count 3 at +0x4C, three NUL-terminated semantics from +0x50, then
-// 28 attribute bytes per element. The candidate codes 6/28/16 and the 0x1C word sit in the raw attribute blocks only to
-// show the converter refuses the element rather than adopting them as DXGI formats (docs/graphics_record.md section 5).
-Bytes make_layout_with_elements() {
-    Bytes blob(188, 0);
-    put_u32(&blob, 0x4c, 3);
-    const char names[] = "POSITION\0COLOR\0TEXCOORD\0";
-    std::memcpy(blob.data() + 0x50, names, sizeof names - 1);
-    const std::uint32_t candidate_formats[3] = {6, 28, 16};
-    const std::size_t attributes = 0x50 + (sizeof names - 1);
-    for (std::size_t element = 0; element < 3; ++element) {
-        const std::size_t at = attributes + element * 28;
-        for (std::size_t word = 0; word < 7; ++word)
-            put_u32(&blob, at + 4 * word, 0x01020304u + 0x10u * static_cast<std::uint32_t>(element) +
-                                                 static_cast<std::uint32_t>(word));
-        put_u32(&blob, at + 4, candidate_formats[element]);
-        put_u32(&blob, at + 0x10, 0x1cu);
+// One element of the measured input-layout table: its printable name and its six attribute words (docs/input_layout.md).
+// Attribute word 1 is the format and word 3 the aligned byte offset in the measured samples; every other word is 0.
+struct LayoutElement {
+    const char* name;
+    std::array<std::uint32_t, rt::graphics_record::kInputLayoutAttributeWords> words;
+};
+
+std::array<std::uint32_t, rt::graphics_record::kInputLayoutAttributeWords> layout_words(std::uint32_t format,
+                                                                                        std::uint32_t offset,
+                                                                                        std::uint32_t semantic_index = 0) {
+    std::array<std::uint32_t, rt::graphics_record::kInputLayoutAttributeWords> words{};
+    words[0] = semantic_index;
+    words[1] = format;
+    words[3] = offset;
+    return words;
+}
+
+// A blob in the measured shape: element count at +0x4C, then per element a u32 name length including the NUL, the name
+// bytes and a 24-byte attribute block, then zero padding to a 4-byte boundary. Sizes are 80 (count 0), 120/1, 152/2,
+// 156/2, 188/3 and 224/4.
+Bytes make_input_layout(std::initializer_list<LayoutElement> elements) {
+    std::size_t size = rt::graphics_record::kInputLayoutHeaderBytes;
+    for (const LayoutElement& element : elements)
+        size += rt::graphics_record::kInputLayoutNameLengthBytes + std::strlen(element.name) + 1 +
+                rt::graphics_record::kInputLayoutAttributeBytes;
+    size = (size + 3) & ~std::size_t{3};
+    Bytes blob(size, 0);
+    put_u32(&blob, rt::graphics_record::kInputLayoutCountOffset, static_cast<std::uint32_t>(elements.size()));
+    std::size_t at = rt::graphics_record::kInputLayoutHeaderBytes;
+    for (const LayoutElement& element : elements) {
+        const std::uint32_t name_bytes = static_cast<std::uint32_t>(std::strlen(element.name)) + 1;
+        put_u32(&blob, at, name_bytes);
+        at += rt::graphics_record::kInputLayoutNameLengthBytes;
+        std::memcpy(blob.data() + at, element.name, name_bytes);
+        at += name_bytes;
+        for (std::size_t word = 0; word < element.words.size(); ++word) put_u32(&blob, at + 4 * word, element.words[word]);
+        at += rt::graphics_record::kInputLayoutAttributeBytes;
     }
     return blob;
+}
+
+// The measured shapes, with the measured format words and the packed offsets they imply:
+Bytes make_layout_120() { return make_input_layout({{"POSITION", layout_words(6, 0)}}); }
+Bytes make_layout_152() {
+    return make_input_layout({{"POSITION", layout_words(6, 0)}, {"COLOR", layout_words(28, 12)}});
+}
+Bytes make_layout_156() {
+    return make_input_layout({{"TEXCOORD", layout_words(16, 0)}, {"POSITION", layout_words(16, 8)}});
+}
+Bytes make_layout_188() {
+    return make_input_layout(
+        {{"POSITION", layout_words(6, 0)}, {"COLOR", layout_words(28, 12)}, {"TEXCOORD", layout_words(16, 16)}});
+}
+// The 224-byte shape: COLOR0 U8x4 at 0, TEXCOORD float2 at 4, POSITION float2 at 12, COLOR2 U8x4 at 20. The last
+// element is the measured one that pins the attribute field order: its word 0 is 2 (the COLOR2 semantic index), its
+// word 1 is 30 (DXGI_FORMAT_R8G8B8A8_UINT) and its word 3 is 20 (the packed offset).
+Bytes make_layout_224() {
+    return make_input_layout({{"COLOR", layout_words(28, 0)},
+                              {"TEXCOORD", layout_words(16, 4)},
+                              {"POSITION", layout_words(16, 12)},
+                              {"COLOR", layout_words(30, 20, 2)}});
 }
 
 // A kind-2 stage blob: head (kind 2, size word, unknown word, 0x40 tag) and 32-byte records whose tags end with 0x43.
@@ -201,21 +245,31 @@ Bytes make_descriptor(const Bytes& state, const Bytes& layout, const std::vector
     return descriptor;
 }
 
-// A decoded record from the named slots (PS+VS when omitted).
-Record make_record(const std::vector<int>& slots = {kStageSlotPs, kStageSlotVs}, const Bytes& layout = Bytes{}) {
-    const Bytes state = make_state_blob();
-    const Bytes input_layout = layout.empty() ? make_empty_layout() : layout;
-    const Bytes ps_program = fspx_code(0x101);
-    const Bytes vs_program = fspx_code(0x202);
-    const Bytes ms_program = fspx_code(0x303);
-    const Bytes ps_blob = make_stage_blob({0x41, 0x43});
-    const Bytes vs_blob = make_stage_blob({0x41, 0x43});
-    const Bytes ms_blob = make_stage_blob({0x42, 0x43});
-    const Bytes descriptor =
-        make_descriptor(state, input_layout, slots, ps_program, ps_blob, vs_program, vs_blob, ms_program, ms_blob);
+// A decoded record plus the bytes its spans point at. The record carries pointers into these vectors, so the fixture
+// has to outlive every build() call made with it (the record is never decoded into dangling storage).
+struct RecordFixture {
+    Bytes state = make_state_blob();
+    Bytes layout = make_empty_layout();
+    Bytes ps_program = fspx_code(0x101);
+    Bytes vs_program = fspx_code(0x202);
+    Bytes ms_program = fspx_code(0x303);
+    Bytes ps_blob = make_stage_blob({0x41, 0x43});
+    Bytes vs_blob = make_stage_blob({0x41, 0x43});
+    Bytes ms_blob = make_stage_blob({0x42, 0x43});
+    Bytes descriptor;
     Record record;
-    if (!rt::graphics_record::decode(descriptor.data(), descriptor.size(), &record)) record.stage_count = 0;
-    return record;
+};
+
+// A decoded record from the named slots (PS+VS when omitted) with the given input layout (the 80-byte empty layout when
+// omitted).
+RecordFixture make_record(const std::vector<int>& slots = {kStageSlotPs, kStageSlotVs}, const Bytes& layout = Bytes{}) {
+    RecordFixture fixture;
+    if (!layout.empty()) fixture.layout = layout;
+    fixture.descriptor = make_descriptor(fixture.state, fixture.layout, slots, fixture.ps_program, fixture.ps_blob,
+                                         fixture.vs_program, fixture.vs_blob, fixture.ms_program, fixture.ms_blob);
+    if (!rt::graphics_record::decode(fixture.descriptor.data(), fixture.descriptor.size(), &fixture.record))
+        fixture.record.stage_count = 0;
+    return fixture;
 }
 
 // ---- The synthetic shader index -----------------------------------------------------------------------------------
@@ -476,7 +530,8 @@ pso::GraphicsPsoInputs base_inputs(const void* ps, SIZE_T ps_size, const void* v
 }
 
 void test_build_success() {
-    const Record record = make_record();
+    const RecordFixture fixture = make_record();
+    const Record& record = fixture.record;
     check(record.stage_count == 2, "build: the synthetic PS+VS record decodes");
     const Bytes ps = fspx_code(0x101);
     const Bytes vs = fspx_code(0x202);
@@ -575,7 +630,8 @@ void test_build_success() {
 }
 
 void test_build_ps_only() {
-    const Record record = make_record({kStageSlotPs});
+    const RecordFixture fixture = make_record({kStageSlotPs});
+    const Record& record = fixture.record;
     check(record.stage_count == 1 && record.stages[0].slot == kStageSlotPs, "build: the PS-only record decodes");
     const Bytes ps = fspx_code(0x101);
     const pso::GraphicsPsoInputs inputs = base_inputs(ps.data(), ps.size(), nullptr, 0);
@@ -586,24 +642,215 @@ void test_build_ps_only() {
           "build: a PS-only record has a pixel stage and no vertex stage");
 }
 
+// The input-layout element table wired into D3D12_INPUT_ELEMENT_DESC entries (docs/input_layout.md).
+void test_build_input_layout() {
+    const Bytes ps = fspx_code(0x101);
+    const Bytes vs = fspx_code(0x202);
+    const pso::GraphicsPsoInputs inputs = base_inputs(ps.data(), ps.size(), vs.data(), vs.size());
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC desc{};
+    std::string why;
+
+    // The measured format words are the documented DXGI enum values, which is the mapping build() applies.
+    check(pso::measured_input_format(2) && pso::measured_input_format(2)->dxgi == DXGI_FORMAT_R32G32B32A32_FLOAT &&
+              DXGI_FORMAT_R32G32B32A32_FLOAT == 2 && pso::measured_input_format(2)->bytes == 16,
+          "layout build: format word 2 is DXGI_FORMAT_R32G32B32A32_FLOAT (16 bytes)");
+    check(pso::measured_input_format(6) && pso::measured_input_format(6)->dxgi == DXGI_FORMAT_R32G32B32_FLOAT &&
+              DXGI_FORMAT_R32G32B32_FLOAT == 6 && pso::measured_input_format(6)->bytes == 12,
+          "layout build: format word 6 is DXGI_FORMAT_R32G32B32_FLOAT (12 bytes)");
+    check(pso::measured_input_format(16) && pso::measured_input_format(16)->dxgi == DXGI_FORMAT_R32G32_FLOAT &&
+              DXGI_FORMAT_R32G32_FLOAT == 16 && pso::measured_input_format(16)->bytes == 8,
+          "layout build: format word 16 is DXGI_FORMAT_R32G32_FLOAT (8 bytes)");
+    check(pso::measured_input_format(28) && pso::measured_input_format(28)->dxgi == DXGI_FORMAT_R8G8B8A8_UNORM &&
+              DXGI_FORMAT_R8G8B8A8_UNORM == 28 && pso::measured_input_format(28)->bytes == 4,
+          "layout build: format word 28 is DXGI_FORMAT_R8G8B8A8_UNORM (4 bytes)");
+    check(pso::measured_input_format(30) && pso::measured_input_format(30)->dxgi == DXGI_FORMAT_R8G8B8A8_UINT &&
+              DXGI_FORMAT_R8G8B8A8_UINT == 30 && pso::measured_input_format(30)->bytes == 4,
+          "layout build: format word 30 is DXGI_FORMAT_R8G8B8A8_UINT (4 bytes)");
+    check(!pso::measured_input_format(0) && !pso::measured_input_format(7),
+          "layout build: an unmeasured format word has no mapping");
+
+    // The measured 188-byte shape: three elements become three D3D12_INPUT_ELEMENT_DESC entries with the measured
+    // formats, packed offsets, slot 0, semantic index 0, per-vertex data and step rate 0.
+    const RecordFixture fixture_188 = make_record({kStageSlotPs, kStageSlotVs}, make_layout_188());
+    const Record& record_188 = fixture_188.record;
+    check(record_188.stage_count == 2 && pso::build(record_188, inputs, &desc, &why),
+          "layout build: a record with the measured 188-byte layout builds");
+    check(desc.InputLayout.NumElements == 3 && desc.InputLayout.pInputElementDescs != nullptr,
+          "layout build: the description carries the three decoded elements");
+    if (desc.InputLayout.NumElements == 3 && desc.InputLayout.pInputElementDescs) {
+        const D3D12_INPUT_ELEMENT_DESC* e = desc.InputLayout.pInputElementDescs;
+        check(std::strcmp(e[0].SemanticName, "POSITION") == 0 && e[0].SemanticIndex == 0 &&
+                  e[0].Format == DXGI_FORMAT_R32G32B32_FLOAT && e[0].InputSlot == 0 && e[0].AlignedByteOffset == 0 &&
+                  e[0].InputSlotClass == D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA && e[0].InstanceDataStepRate == 0,
+              "layout build: POSITION -> R32G32B32_FLOAT, slot 0, offset 0, per-vertex");
+        check(std::strcmp(e[1].SemanticName, "COLOR") == 0 && e[1].Format == DXGI_FORMAT_R8G8B8A8_UNORM &&
+                  e[1].AlignedByteOffset == 12,
+              "layout build: COLOR -> R8G8B8A8_UNORM at offset 12");
+        check(std::strcmp(e[2].SemanticName, "TEXCOORD") == 0 && e[2].Format == DXGI_FORMAT_R32G32_FLOAT &&
+                  e[2].AlignedByteOffset == 16,
+              "layout build: TEXCOORD -> R32G32_FLOAT at offset 16");
+        // The semantic pointers are the record's own validated blob bytes, not a copy that could dangle.
+        check(e[0].SemanticName == reinterpret_cast<const char*>(record_188.input_layout.data + 0x54) &&
+                  e[1].SemanticName == reinterpret_cast<const char*>(record_188.input_layout.data + 0x79),
+              "layout build: each SemanticName points at the record's validated name bytes");
+    }
+
+    // The measured 224-byte shape is the one that pins the attribute field order: its last element is COLOR with word 0
+    // 2 (the COLOR2 semantic index) and word 1 30 (R8G8B8A8_UINT), so the six words are the D3D12 element fields in
+    // order and the duplicate semantic name is not ambiguous.
+    const RecordFixture fixture_224 = make_record({kStageSlotPs, kStageSlotVs}, make_layout_224());
+    check(pso::build(fixture_224.record, inputs, &desc, &why) && desc.InputLayout.NumElements == 4,
+          "layout build: the measured 224-byte four-element layout builds");
+    if (desc.InputLayout.NumElements == 4 && desc.InputLayout.pInputElementDescs) {
+        const D3D12_INPUT_ELEMENT_DESC* e = desc.InputLayout.pInputElementDescs;
+        check(std::strcmp(e[0].SemanticName, "COLOR") == 0 && e[0].SemanticIndex == 0 &&
+                  e[0].Format == DXGI_FORMAT_R8G8B8A8_UNORM && e[0].AlignedByteOffset == 0,
+              "layout build: COLOR0 -> R8G8B8A8_UNORM at offset 0 with semantic index 0");
+        check(std::strcmp(e[3].SemanticName, "COLOR") == 0 && e[3].SemanticIndex == 2 &&
+                  e[3].Format == DXGI_FORMAT_R8G8B8A8_UINT && e[3].AlignedByteOffset == 20,
+              "layout build: COLOR2 -> R8G8B8A8_UINT at offset 20 with semantic index 2");
+    }
+
+    // Every other measured shape builds with its own formats and packed offsets.
+    const RecordFixture fixture_120 = make_record({kStageSlotPs, kStageSlotVs}, make_layout_120());
+    check(pso::build(fixture_120.record, inputs, &desc, &why) && desc.InputLayout.NumElements == 1 &&
+              desc.InputLayout.pInputElementDescs[0].Format == DXGI_FORMAT_R32G32B32_FLOAT,
+          "layout build: the measured 120-byte shape builds one POSITION element");
+    const RecordFixture fixture_152 = make_record({kStageSlotPs, kStageSlotVs}, make_layout_152());
+    check(pso::build(fixture_152.record, inputs, &desc, &why) && desc.InputLayout.NumElements == 2 &&
+              desc.InputLayout.pInputElementDescs[1].Format == DXGI_FORMAT_R8G8B8A8_UNORM &&
+              desc.InputLayout.pInputElementDescs[1].AlignedByteOffset == 12,
+          "layout build: the measured 152-byte shape builds POSITION + COLOR at offset 12");
+    const RecordFixture fixture_156 = make_record({kStageSlotPs, kStageSlotVs}, make_layout_156());
+    check(pso::build(fixture_156.record, inputs, &desc, &why) && desc.InputLayout.NumElements == 2 &&
+              desc.InputLayout.pInputElementDescs[0].Format == DXGI_FORMAT_R32G32_FLOAT &&
+              desc.InputLayout.pInputElementDescs[0].AlignedByteOffset == 0 &&
+              desc.InputLayout.pInputElementDescs[1].AlignedByteOffset == 8,
+          "layout build: the measured 156-byte shape builds packed float2 elements at 0 and 8");
+
+    // A measured gap between elements is emitted as stored: the post-decode boot carries an 188-byte shape with
+    // COLOR at offset 24 after a 12-byte POSITION, and D3D12 takes AlignedByteOffset verbatim (the description has no
+    // stride), so gaps build and the stored offsets reach the description unchanged.
+    const RecordFixture gapped = make_record(
+        {kStageSlotPs, kStageSlotVs},
+        make_input_layout({{"POSITION", layout_words(6, 0)}, {"COLOR", layout_words(28, 24)},
+                           {"TEXCOORD", layout_words(16, 28)}}));
+    check(pso::build(gapped.record, inputs, &desc, &why) && desc.InputLayout.NumElements == 3,
+          "layout build: a measured gap between elements builds");
+    if (desc.InputLayout.NumElements == 3 && desc.InputLayout.pInputElementDescs) {
+        const D3D12_INPUT_ELEMENT_DESC* e = desc.InputLayout.pInputElementDescs;
+        check(e[1].AlignedByteOffset == 24 && e[2].AlignedByteOffset == 28,
+              "layout build: the stored gap offsets 24 and 28 reach the description verbatim");
+    }
+    std::array<std::uint32_t, rt::graphics_record::kInputLayoutAttributeWords> append_words = layout_words(6, 0);
+    append_words[3] = D3D12_APPEND_ALIGNED_ELEMENT;
+    const RecordFixture append = make_record({kStageSlotPs, kStageSlotVs},
+                                             make_input_layout({{"POSITION", append_words}}));
+    why.clear();
+    check(!pso::build(append.record, inputs, &desc, &why) &&
+              why.find("input_layout.elements[0].aligned_byte_offset[4294967295]") != std::string::npos,
+          "layout build: the unmeasured D3D12_APPEND_ALIGNED_ELEMENT sentinel is refused with its value");
+
+    // Format word 2's 16-byte size is not independently offset-confirmed, so the offset check is its
+    // falsifier: a following element at 16 bytes is accepted, one at 12 is refused and names the offset field.
+    const RecordFixture float4 = make_record(
+        {kStageSlotPs, kStageSlotVs},
+        make_input_layout({{"POSITION", layout_words(2, 0)}, {"COLOR", layout_words(28, 16)}}));
+    check(pso::build(float4.record, inputs, &desc, &why) && desc.InputLayout.NumElements == 2,
+          "layout build: format word 2 advances the packed offset by 16 bytes");
+    const RecordFixture float3 = make_record(
+        {kStageSlotPs, kStageSlotVs},
+        make_input_layout({{"POSITION", layout_words(2, 0)}, {"COLOR", layout_words(28, 12)}}));
+    check(!pso::build(float3.record, inputs, &desc, &why) &&
+              why.find("input_layout.elements[1].aligned_byte_offset[12]") != std::string::npos,
+          "layout build: a 12-byte stride after format word 2 is refused as an overlap, making a wrong size "
+          "hypothesis visible");
+
+    // Refusals. Each field carries the numeric value so the slot-57 boot histogram lists exactly which values remain
+    // unmeasured (the histogram keys a reason by the text before its first ':').
+    const RecordFixture unknown_last = make_record(
+        {kStageSlotPs, kStageSlotVs},
+        make_input_layout({{"POSITION", layout_words(6, 0)}, {"COLOR", layout_words(28, 12)},
+                           {"TEXCOORD", layout_words(7, 16)}}));
+    why.clear();
+    check(!pso::build(unknown_last.record, inputs, &desc, &why),
+          "layout build: an unmeasured format word is refused");
+    check(why.find("input_layout.elements[2].format[7]") != std::string::npos &&
+              why.find("TEXCOORD") != std::string::npos,
+          "layout build: the refusal field carries the element index and the format word value");
+    const RecordFixture unknown_first =
+        make_record({kStageSlotPs, kStageSlotVs}, make_input_layout({{"POSITION", layout_words(7, 0)}}));
+    why.clear();
+    check(!pso::build(unknown_first.record, inputs, &desc, &why) &&
+              why.find("input_layout.elements[0].format[7]") != std::string::npos,
+          "layout build: an unmeasured format word on the first element names elements[0].format[7]");
+
+    std::array<std::uint32_t, rt::graphics_record::kInputLayoutAttributeWords> words = layout_words(6, 0);
+    words[2] = 1;  // word 2 is InputSlot under the measured field order; 0 in every measured element
+    const RecordFixture bad_slot = make_record({kStageSlotPs, kStageSlotVs}, make_input_layout({{"POSITION", words}}));
+    why.clear();
+    check(!pso::build(bad_slot.record, inputs, &desc, &why) &&
+              why.find("input_layout.elements[0].input_slot[1]") != std::string::npos,
+          "layout build: a non-zero input slot is refused with the slot value in the field");
+    words = layout_words(6, 0);
+    words[4] = 1;  // word 4 is InputSlotClass; 0 (per-vertex) in every measured element
+    const RecordFixture bad_class =
+        make_record({kStageSlotPs, kStageSlotVs}, make_input_layout({{"POSITION", words}}));
+    why.clear();
+    check(!pso::build(bad_class.record, inputs, &desc, &why) &&
+              why.find("input_layout.elements[0].input_slot_class[1]") != std::string::npos,
+          "layout build: a non-zero input-slot class is refused with the class value in the field");
+    words = layout_words(6, 0);
+    words[5] = 1;  // word 5 is InstanceDataStepRate; 0 in every measured element
+    const RecordFixture bad_step =
+        make_record({kStageSlotPs, kStageSlotVs}, make_input_layout({{"POSITION", words}}));
+    why.clear();
+    check(!pso::build(bad_step.record, inputs, &desc, &why) &&
+              why.find("input_layout.elements[0].instance_step_rate[1]") != std::string::npos,
+          "layout build: a non-zero instance step rate is refused with the rate value in the field");
+
+    const RecordFixture wrong_offset = make_record(
+        {kStageSlotPs, kStageSlotVs},
+        make_input_layout({{"POSITION", layout_words(6, 0)}, {"COLOR", layout_words(28, 8)}}));
+    why.clear();
+    check(!pso::build(wrong_offset.record, inputs, &desc, &why) &&
+              why.find("input_layout.elements[1].aligned_byte_offset[8]") != std::string::npos,
+          "layout build: an aligned offset that overlaps the preceding element is refused with its value");
+
+    // Two elements with the same name and the same index would be one D3D12 semantic; that is refused, while the
+    // measured 224-byte shape's COLOR 0 / COLOR 2 above is not a duplicate.
+    const RecordFixture duplicate = make_record(
+        {kStageSlotPs, kStageSlotVs},
+        make_input_layout({{"POSITION", layout_words(6, 0)}, {"POSITION", layout_words(6, 12)}}));
+    why.clear();
+    check(!pso::build(duplicate.record, inputs, &desc, &why),
+          "layout build: a repeated semantic name and index is refused");
+    check(why.find("input_layout.elements[1].semantic_index[0]") != std::string::npos,
+          "layout build: the duplicate-semantic refusal names the element and the index");
+
+    const RecordFixture no_vertex = make_record({kStageSlotPs}, make_layout_120());
+    why.clear();
+    check(!pso::build(no_vertex.record, inputs, &desc, &why),
+          "layout build: an input layout with elements but no vertex stage is refused");
+    check(why.find("record.stages") != std::string::npos && why.find("no vertex stage") != std::string::npos,
+          "layout build: the refusal says the input layout needs a vertex stage");
+
+    // A refusal leaves the output description untouched.
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC untouched{};
+    untouched.SampleDesc.Count = 77;
+    why.clear();
+    check(!pso::build(unknown_last.record, inputs, &untouched, &why) && untouched.SampleDesc.Count == 77,
+          "layout build: the output description is untouched on a layout refusal");
+}
+
 void test_build_refusals() {
-    const Record record = make_record();
+    const RecordFixture fixture = make_record();
+    const Record& record = fixture.record;
     const Bytes ps = fspx_code(0x101);
     const Bytes vs = fspx_code(0x202);
     const pso::GraphicsPsoInputs good = base_inputs(ps.data(), ps.size(), vs.data(), vs.size());
     D3D12_GRAPHICS_PIPELINE_STATE_DESC desc{};
     std::string why;
-
-    // The input layout: any element is refused with its format field named, because the console format code is not
-    // mapped to a DXGI format and the attribute bytes are undecoded.
-    const Record with_elements = make_record({kStageSlotPs, kStageSlotVs}, make_layout_with_elements());
-    check(with_elements.stage_count == 2, "build: the record with three layout elements decodes");
-    check(!pso::build(with_elements, good, &desc, &why),
-          "build: a record whose input layout has an element is refused");
-    check(why.find("input_layout.elements[0].format") != std::string::npos && why.find("POSITION") != std::string::npos,
-          "build: the refusal names input_layout.elements[0].format and the element's semantic");
-    check(why.find("D3D12_INPUT_ELEMENT_DESC") != std::string::npos,
-          "build: the refusal says no D3D12_INPUT_ELEMENT_DESC can be built");
 
     // The fixed-function state blob.
     Record no_state = record;
@@ -630,7 +877,8 @@ void test_build_refusals() {
     why.clear();
     check(!pso::build(record, no_vs, &desc, &why), "build: a record stage without resolved program bytes is refused");
     check(why.find("stages[1] (vs)") != std::string::npos, "build: the refusal names the stage slot");
-    const Record ps_only = make_record({kStageSlotPs});
+    const RecordFixture ps_only_fixture = make_record({kStageSlotPs});
+    const Record& ps_only = ps_only_fixture.record;
     why.clear();
     check(!pso::build(ps_only, good, &desc, &why), "build: bytes for a stage the record does not name are refused");
     check(why.find("stages[1] (vs)") != std::string::npos && why.find("no vs stage") != std::string::npos,
@@ -693,7 +941,8 @@ void test_build_refusals() {
     check(why.find("defaults.strip_cut") != std::string::npos, "build: the refusal names defaults.strip_cut");
 
     // A mesh stage cannot be expressed in a D3D12_GRAPHICS_PIPELINE_STATE_DESC.
-    const Record ps_ms = make_record({kStageSlotPs, kStageSlotMs});
+    const RecordFixture ps_ms_fixture = make_record({kStageSlotPs, kStageSlotMs});
+    const Record& ps_ms = ps_ms_fixture.record;
     check(ps_ms.stage_count == 2, "build: a PS+MS record decodes");
     pso::GraphicsPsoInputs with_ms = base_inputs(ps.data(), ps.size(), nullptr, 0);
     with_ms.stages[kStageSlotMs] = {ps.data(), ps.size()};
@@ -734,7 +983,7 @@ void print_findings() {
         {"pRootSignature", "caller, mapped from record.root_signature (decoder copies only the pointer)"},
         {"VS/PS bytecode", "caller's resolved native program per record slot (resolve_native_stage)"},
         {"DS/HS/GS", "empty: a record has no such slot"},
-        {"InputLayout", "decoded; empty only - any element refused at input_layout.elements[i].format"},
+        {"InputLayout", "decoded element table; formats, semantic index and packed offsets from the measured words"},
         {"Rasterizer/Blend/DepthStencil/Sample/Topology", "caller's FixedFunctionState (docs/graphics_pso.md)"},
         {"RTVFormats/DSVFormat/NumRenderTargets", "caller"},
         {"NodeMask/Flags/CachedPSO/StreamOutput", "neutral values: the record carries none of them"},
@@ -750,7 +999,10 @@ void print_findings() {
         {"build", "record.root_signature: no console root signature at +0x00"},
         {"build", "record.state: the fixed-function blob is missing or outside 380..520 B"},
         {"build", "record.input_layout: the layout blob does not decode"},
-        {"build", "input_layout.elements[i].format: an element's format code is not mapped to DXGI"},
+        {"build", "input_layout.elements[i].format[word]: an element's format word is not one of the measured DXGI values"},
+        {"build", "input_layout.elements[i].input_slot[n] / input_slot_class[n] / instance_step_rate[n]: a non-zero unmeasured word"},
+        {"build", "input_layout.elements[i].aligned_byte_offset: an offset that is not the measured packed one"},
+        {"build", "input_layout.elements[i].semantic_index[n]: a repeated semantic name and index"},
         {"build", "pRootSignature: the caller mapped no PC root signature"},
         {"build", "stages[i] (stage): the record stage has no resolved bytes, or gets bytes it has no slot for"},
         {"build", "render_target_count / rtv_formats[i]: an attachment list D3D12 would refuse"},
@@ -775,6 +1027,7 @@ int main() {
     test_documented_default_state();
     test_build_success();
     test_build_ps_only();
+    test_build_input_layout();
     test_build_refusals();
 
     if (g_failures != 0) {

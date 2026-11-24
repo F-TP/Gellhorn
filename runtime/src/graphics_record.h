@@ -22,19 +22,19 @@
 // Decoded vs unknown (docs/graphics_record.md has the field table with the evidence for every row):
 //   decoded: the six pointer/size pairs and their offsets, which slot/stage each pair is, the record's measured size
 //            envelope (state and input-layout ranges, program size range, kind-2 blob record envelope), the input
-//            layout's element count, its NUL-terminated semantics and its 28-byte attribute blocks, and the stage
-//            blob's kind word, size word, 0x40 head tag, 0x41/0x42/0x43 record tags, 16-byte source digest and the
-//            12 zero bytes after it.
-//   unknown, kept raw: the whole fixed-function state blob (no word's meaning is measured), the input layout's format
-//            code, input slot, aligned byte offset, semantic index and per-vertex flag, and the stage blob's head
-//            words and 0x41/0x42 record bodies. They stay unknown on purpose: a guessed format or a guessed state
-//            produces a wrong PSO, which is far harder to find than a refusal.
+//            layout's 0x50-byte header, its element count and its per-element records (a length-prefixed semantic name
+//            and a 24-byte attribute block of six words), and the stage blob's kind word, size word, 0x40 head tag,
+//            0x41/0x42/0x43 record tags, 16-byte source digest and the 12 zero bytes after it.
+//   unknown, kept raw: the whole fixed-function state blob (no word's meaning is measured), the meaning of the input
+//            layout's attribute words (this file keeps all six verbatim; graphics_pso::build decides word 1 is the
+//            format and word 3 the aligned byte offset from the measured values, docs/input_layout.md), and the stage
+//            blob's head words and 0x41/0x42 record bodies. They stay unknown on purpose: a guessed format or a
+//            guessed state produces a wrong PSO, which is far harder to find than a refusal.
 #pragma once
 
 #include <array>
 #include <cstddef>
 #include <cstdint>
-#include <optional>
 #include <string>
 #include <vector>
 
@@ -90,11 +90,31 @@ inline constexpr std::uint32_t kStageBlobRecordTagA = 0x41;
 inline constexpr std::uint32_t kStageBlobRecordTagB = 0x42;
 inline constexpr std::uint32_t kStageBlobDigestTag = 0x43;
 
-// Input layout (docs/boot_frontier.md, slot-57 section: element count at +0x4C, NUL-terminated semantics inline).
+// Input layout (docs/input_layout.md). Measured on the six boot shapes (80 B/count 0, 120/1, 152/2, 156/2, 188/3,
+// 224/4): a 0x50-byte header with the element count at +0x4C, then one record per element, back to back from +0x50:
+//
+//   +0x50  u32 name length INCLUDING the NUL terminator, then that many name bytes, then a 24-byte attribute block
+//
+// and the blob's bytes are the records' bytes, zero-padded to a 32-bit boundary:
+//
+//   size == 0x50 + sum(4 + name_len + 24) rounded up to a multiple of 4
+//
+// The same sizes also fit "all names first, then count*28 attribute bytes" (4 + name_len + 24 == name_len + 28), but
+// that reading needs the header to end at +0x54 while every measured first name starts at +0x54 from the +0x50 length
+// word, so it leaves four bytes unexplained and the six measured sizes refute it. The 24-byte attribute block's six
+// words are kept verbatim here; graphics_pso::build decides their field meaning from the measured values.
 inline constexpr std::size_t kInputLayoutHeaderBytes = 0x50;
 inline constexpr std::size_t kInputLayoutCountOffset = 0x4C;
-inline constexpr std::size_t kInputLayoutNamesOffset = 0x50;
-inline constexpr std::size_t kInputLayoutAttributeBytes = 28;
+inline constexpr std::size_t kInputLayoutNameLengthBytes = 4;  // u32 before every name
+inline constexpr std::size_t kInputLayoutNameMinBytes = 2;     // shortest length this decoder accepts: 1 char + NUL
+inline constexpr std::size_t kInputLayoutNameMaxBytes = 64;    // a bound; the measured names are 6 and 9 bytes
+inline constexpr std::size_t kInputLayoutAttributeWords = 6;
+inline constexpr std::size_t kInputLayoutAttributeBytes = kInputLayoutAttributeWords * 4;
+inline constexpr std::size_t kInputLayoutMinElementBytes =
+    kInputLayoutNameLengthBytes + kInputLayoutNameMinBytes + kInputLayoutAttributeBytes;
+// The most elements the measured 80..340-byte envelope can hold. It bounds the count before anything is allocated.
+inline constexpr std::size_t kInputLayoutMaxElements =
+    (kInputLayoutMaxBytes - kInputLayoutHeaderBytes) / kInputLayoutMinElementBytes;
 
 // ---- The decoded record ------------------------------------------------------------------------------------------
 
@@ -121,23 +141,25 @@ bool decode(const void* descriptor, std::size_t available, Record* out);
 
 // ---- The input layout -------------------------------------------------------------------------------------------
 
-// One input-layout element. Only `semantic` and the raw 28 attribute bytes are measured; every other member stays
-// unset rather than guessed, because a wrong format or offset is a wrong pipeline that is hard to find later.
+// One input-layout element, in stored order (docs/input_layout.md). decode_input_layout() decodes the semantic name
+// and keeps the six-word attribute block verbatim. The words' field meaning is a decision graphics_pso::build makes
+// from the measured values: they are the D3D12_INPUT_ELEMENT_DESC fields in their D3D12 order with the name pointer
+// replaced by the stored name - word 0 SemanticIndex (measured: 2 on a COLOR element, i.e. COLOR2), word 1 Format,
+// word 2 InputSlot (0), word 3 AlignedByteOffset, word 4 InputSlotClass (0, per-vertex), word 5 InstanceDataStepRate
+// (0). build() maps word 1 through the measured DXGI table and refuses any other value by name.
 struct Element {
-    std::string semantic;  // decoded: NUL-terminated string stored inline, in element order
-    std::optional<std::uint32_t> semantic_index;       // unknown
-    std::optional<std::uint32_t> format;               // unknown: the observed codes 6/28/16 are not adopted as DXGI
-    std::optional<std::uint32_t> input_slot;           // unknown
-    std::optional<std::uint32_t> aligned_byte_offset;  // unknown
-    std::optional<bool> per_vertex_data;               // unknown (true per-vertex, false per-instance)
-    // The measured 28 attribute bytes for this element, kept verbatim. Their field encoding is not decoded, so no
-    // member above is filled from them.
-    std::array<std::uint8_t, kInputLayoutAttributeBytes> attribute{};
+    std::string semantic;              // the printable name, without its NUL terminator
+    std::size_t semantic_offset = 0;   // offset of the NUL-terminated name in the blob (a stable SemanticName)
+    std::uint32_t name_bytes = 0;      // the stored length word: name bytes including the NUL terminator
+    std::array<std::uint32_t, kInputLayoutAttributeWords> attribute{};  // the six attribute words, verbatim
 };
 
-// Decodes the input-layout blob: element count at +0x4C, `count` NUL-terminated printable semantics from +0x50, then
-// exactly count*28 attribute bytes. Returns false when the blob is shorter than its header, when a semantic is not a
-// terminated printable run, when the count contradicts the remaining bytes, or when the size is outside 80..340.
+// Decodes the input-layout blob: element count at +0x4C, then `count` records from +0x50, each a u32 name length
+// including the NUL, the name bytes and a 24-byte attribute block; the records' bytes are zero-padded to a 4-byte
+// boundary, so the blob must be filled exactly (no slack, no overflow). Returns false when the size is outside
+// 80..340 bytes or not a whole number of words, when the count cannot fit the envelope, when a length word or a name
+// is not the measured shape (length 2..64, NUL-terminated, printable ASCII), when the padding is not zero, or when the
+// records do not fill the blob exactly. The attribute words are not interpreted here: this file is pure bytes.
 bool decode_input_layout(Span blob, std::vector<Element>* out);
 
 // ---- The fixed-function state blob ------------------------------------------------------------------------------

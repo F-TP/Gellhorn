@@ -127,39 +127,46 @@ bool decode_input_layout(Span blob, std::vector<Element>* out) {
     out->clear();
     if (!blob.data) return false;
     if (blob.size < kInputLayoutMinBytes || blob.size > kInputLayoutMaxBytes) return false;
+    if (blob.size % 4 != 0) return false;  // every measured blob is a whole number of 32-bit words
 
     const std::uint32_t count = load_u32(blob.data + kInputLayoutCountOffset);
-    const std::size_t after_header = blob.size - kInputLayoutHeaderBytes;
-    // Each element needs at least one name byte (its own NUL) and its 28 attribute bytes. This bounds `count` from
-    // the bytes that are actually there before anything is allocated from it.
-    if (count > after_header / (1 + kInputLayoutAttributeBytes)) return false;
+    // Each element needs its length word, at least one printable name byte plus the NUL and its attribute block. The
+    // bound comes from the blob that is actually there, before anything is allocated from the count.
+    if (count > kInputLayoutMaxElements) return false;
 
     std::vector<Element> elements(count);
-    std::size_t position = kInputLayoutNamesOffset;
+    std::size_t position = kInputLayoutHeaderBytes;
     for (std::uint32_t index = 0; index < count; ++index) {
-        const std::size_t start = position;
-        while (position < blob.size && blob.data[position] != 0) {
-            const std::uint8_t byte = blob.data[position];
-            // A semantic name is a printable NUL-terminated run in the measured samples. A binary byte here means the
-            // element boundary this decoder assumes does not hold for this blob, so it refuses.
-            if (byte < 0x20 || byte > 0x7e) return false;
-            ++position;
+        if (position + kInputLayoutNameLengthBytes > blob.size) return false;
+        const std::uint32_t name_bytes = load_u32(blob.data + position);
+        position += kInputLayoutNameLengthBytes;
+        // The measured length words are 6 (COLOR) and 9 (POSITION, TEXCOORD). A shorter one cannot carry a name; a
+        // longer one is outside the measured shape, so the element boundary this decoder assumes is not the blob's.
+        if (name_bytes < kInputLayoutNameMinBytes || name_bytes > kInputLayoutNameMaxBytes) return false;
+        if (position + name_bytes + kInputLayoutAttributeBytes > blob.size) return false;
+        if (blob.data[position + name_bytes - 1] != 0) return false;  // the name must end in its own NUL
+        for (std::uint32_t byte = 0; byte + 1 < name_bytes; ++byte) {
+            const std::uint8_t value = blob.data[position + byte];
+            if (value < 0x20 || value > 0x7e) return false;  // a measured name is printable ASCII
         }
-        if (position >= blob.size) return false;  // unterminated name
-        elements[index].semantic.assign(reinterpret_cast<const char*>(blob.data + start), position - start);
-        ++position;  // the NUL terminator
+        Element& element = elements[index];
+        element.semantic.assign(reinterpret_cast<const char*>(blob.data + position), name_bytes - 1);
+        element.semantic_offset = position;
+        element.name_bytes = name_bytes;
+        position += name_bytes;
+        for (std::size_t word = 0; word < kInputLayoutAttributeWords; ++word)
+            element.attribute[word] = load_u32(blob.data + position + 4 * word);
+        position += kInputLayoutAttributeBytes;
     }
 
-    // The measured blobs hold all names inline first, then 28 attribute bytes per element; the two blocks together
-    // must fill the blob exactly. If they do not, the element boundary is not the measured one and nothing is
-    // returned, rather than pairing names with bytes whose encoding is not known.
-    const std::size_t attribute_bytes = static_cast<std::size_t>(count) * kInputLayoutAttributeBytes;
-    if (position > blob.size || blob.size - position != attribute_bytes) return false;
-    for (std::uint32_t index = 0; index < count; ++index) {
-        std::memcpy(elements[index].attribute.data(),
-                    blob.data + position + static_cast<std::size_t>(index) * kInputLayoutAttributeBytes,
-                    kInputLayoutAttributeBytes);
-    }
+    // Exact fill: the element records end at `position` and the blob continues only with zero padding to the next
+    // 32-bit boundary. A remainder of any other size, a non-zero padding byte, or slack after the padding means the
+    // element boundary is not the measured one, so nothing is returned rather than pairing names with bytes whose
+    // encoding is not known.
+    const std::size_t padded = (position + 3) & ~static_cast<std::size_t>(3);
+    if (padded != blob.size) return false;
+    for (std::size_t at = position; at < blob.size; ++at)
+        if (blob.data[at] != 0) return false;
 
     *out = std::move(elements);
     return true;

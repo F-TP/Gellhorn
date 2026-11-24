@@ -17,11 +17,13 @@
 // only the pointer value) and the whole fixed-function state, because no word of the 380..520-byte state blob is decoded
 // (docs/graphics_record.md section 4). GraphicsPsoInputs::defaults is that state, every field the caller's, and
 // documented_default_state() is the one set the project documents as the measurement stand-in for the undecoded blob.
-// What the record cannot prove is a refusal with the field named in `why`, never a guess: today that is every record
-// whose decoded input layout has an element, because the console format code is not mapped to a DXGI format and the
-// 28 attribute bytes' field encoding (slot, offset, class, index) is undecoded too (section 5).
+// What the record cannot prove is a refusal with the field named in `why`, never a guess: a layout element whose format
+// word is not one of the measured DXGI values, whose input slot, input-slot class or instance step rate is not the
+// measured 0, whose aligned byte offset is not the measured packed one, or whose semantic name/index duplicates another
+// is refused by name (docs/input_layout.md); nothing is mapped by analogy.
 //
-// docs/graphics_pso.md has the input contract, the refusal table, the documented default set and the wiring.
+// docs/graphics_pso.md has the input contract, the refusal table, the documented default set and the wiring;
+// docs/input_layout.md has the measured input-layout element table and the format-word decision.
 #pragma once
 
 #include <windows.h>
@@ -108,6 +110,30 @@ struct FixedFunctionState {
 // decision the caller makes and logs (the create_standin_graphics_pipeline defaults are the same set).
 FixedFunctionState documented_default_state();
 
+// One input-layout format word this tree has measured, with the DXGI format it means and its bytes per vertex.
+struct InputFormat {
+    std::uint32_t console_word;  // the element's attribute word 1, as stored in the input-layout blob
+    DXGI_FORMAT dxgi;
+    UINT bytes;  // bytes per vertex the DXGI format occupies; the aligned-offset check advances by this
+};
+
+// The input-layout format words the measured boot shapes carry, tested against the documented DXGI enum
+// (docs/input_layout.md): 2 = DXGI_FORMAT_R32G32B32A32_FLOAT (16 B), 6 = DXGI_FORMAT_R32G32B32_FLOAT (12 B),
+// 16 = DXGI_FORMAT_R32G32_FLOAT (8 B), 28 = DXGI_FORMAT_R8G8B8A8_UNORM (4 B), 30 = DXGI_FORMAT_R8G8B8A8_UINT (4 B).
+// 6, 16 and 28 have their byte sizes independently confirmed by the measured packed offsets; 2 and 30 are only seen as
+// the last element of their layout, so their size is the DXGI enum reading and the packed-offset check is the
+// falsifier. A word outside this table is refused by build() with the value in the field name, never mapped by analogy.
+inline constexpr InputFormat kMeasuredInputFormats[] = {
+    {2, DXGI_FORMAT_R32G32B32A32_FLOAT, 16},
+    {6, DXGI_FORMAT_R32G32B32_FLOAT, 12},
+    {16, DXGI_FORMAT_R32G32_FLOAT, 8},
+    {28, DXGI_FORMAT_R8G8B8A8_UNORM, 4},
+    {30, DXGI_FORMAT_R8G8B8A8_UINT, 4},
+};
+
+// The measured format for one stored format word, or null when this tree has not measured that word.
+const InputFormat* measured_input_format(std::uint32_t console_word);
+
 // One stage's bytecode, indexed by record slot (rt::graphics_record::kStageSlotPs, kStageSlotVs, kStageSlotMs): the
 // bytes create_graphics will classify and resolve. For a slot-57 record this is the stage's native program as passed
 // (record.stages[i].program), or an FSPX payload carrying its kind-0 state when the caller has one. A slot the record
@@ -137,11 +163,19 @@ struct GraphicsPsoInputs {
 
 // The PC graphics-pipeline description for a decoded record, or false with `why` naming the field that stops it.
 // `out` is untouched on false. On success every D3D12_GRAPHICS_PIPELINE_STATE_DESC field is filled: the stages from
-// `inputs.stages`, the input layout as the decoder proved it (an empty one: any element is refused, see the header
-// comment), the fixed-function state from `inputs.defaults`, the attachments from the caller, and NodeMask 0, flags
-// NONE, no cached PSO and no stream output (the console record carries none of those). A mesh stage is refused: a
-// D3D12_GRAPHICS_PIPELINE_STATE_DESC has no mesh-shader field, so a record with slot 2 needs the pipeline-state-stream
-// path instead (docs/graphics_pso.md).
+// `inputs.stages`, the input layout as the measured element table proves it (an empty blob gives NumElements 0; a
+// blob with elements gives one D3D12_INPUT_ELEMENT_DESC per element, each refused by field when it is not the measured
+// shape, docs/input_layout.md), the fixed-function state from `inputs.defaults`, the attachments from the caller, and
+// NodeMask 0, flags NONE, no cached PSO and no stream output (the console record carries none of those). A mesh stage
+// is refused: a D3D12_GRAPHICS_PIPELINE_STATE_DESC has no mesh-shader field, so a record with slot 2 needs the
+// pipeline-state-stream path instead (docs/graphics_pso.md).
+//
+// The input-element descriptions a built description points at (`InputLayout.pInputElementDescs`) live in storage
+// owned by this backend, not by the caller: the description carries a pointer, not the array. That storage is valid
+// until the next build() on the same thread, and the slot-57 wiring uses the description with
+// CreateGraphicsPipelineState immediately after building it (runtime/shims/d3d12_xs_device.cpp), which is the
+// contract. Each SemanticName points at the record's own blob bytes (they are NUL-terminated and validated), so it
+// has the blob's lifetime.
 bool build(const rt::graphics_record::Record& record, const GraphicsPsoInputs& inputs,
            D3D12_GRAPHICS_PIPELINE_STATE_DESC* out, std::string* why);
 

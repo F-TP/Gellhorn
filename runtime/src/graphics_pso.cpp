@@ -1,5 +1,6 @@
 #include "graphics_pso.h"
 
+#include <array>
 #include <utility>
 
 namespace rt::graphics_pso {
@@ -10,6 +11,12 @@ namespace {
 // program resolved under no graphics stage, so a slot/stage mismatch (a program published for another stage) is named
 // instead of being reported as a missing translation.
 constexpr const char* kStageNames[] = {"ps", "vs", "ms", "gs", "cs"};
+
+// The D3D12_INPUT_ELEMENT_DESC array a built description points at. D3D12_GRAPHICS_PIPELINE_STATE_DESC carries the
+// elements by pointer, not by value, so build() needs storage that outlives it: this per-thread buffer, valid until the
+// next build() on the same thread (the lifetime contract documented in graphics_pso.h). Each SemanticName points into
+// the record's own input-layout blob, which the caller keeps alive for the creation call.
+thread_local std::array<D3D12_INPUT_ELEMENT_DESC, rt::graphics_record::kInputLayoutMaxElements> g_input_elements{};
 
 bool fail(std::string* why, std::string message) {
     if (why) *why = std::move(message);
@@ -31,7 +38,22 @@ std::string record_stage(std::size_t index) {
     return "record.stages[" + std::to_string(index) + "].slot: ";
 }
 
+// The refusal field of one input-layout element: "input_layout.elements[2].format[7]". The slot-57 histogram keys a
+// refusal by the text before its first ':', so an unmapped format word or a non-zero unproven word puts its numeric
+// value in the field and the boot histogram then lists exactly which values remain unmapped.
+std::string element_field(std::size_t index, const std::string& field) {
+    return "input_layout.elements[" + std::to_string(index) + "]." + field;
+}
+
+std::string quoted(const std::string& text) { return "\"" + text + "\""; }
+
 }  // namespace
+
+const InputFormat* measured_input_format(std::uint32_t console_word) {
+    for (const InputFormat& format : kMeasuredInputFormats)
+        if (format.console_word == console_word) return &format;
+    return nullptr;
+}
 
 bool resolve_native_stage(std::span<const std::uint8_t> bytecode, const char* stage,
                           const leonida::ShaderLibrary& library,
@@ -175,9 +197,9 @@ bool build(const rt::graphics_record::Record& record, const GraphicsPsoInputs& i
 
     // ---- The two blobs the record always carries. The state is checked for its measured envelope and then not used:
     // no word of it is decoded (docs/graphics_record.md section 4), so the fixed-function state comes from
-    // `inputs.defaults` instead. The input layout is decoded, and an element is refused: its format code is not mapped
-    // to a DXGI format and the attribute bytes' field encoding is undecoded, so no D3D12_INPUT_ELEMENT_DESC can be
-    // built from it without a guess (section 5).
+    // `inputs.defaults` instead. The input layout is decoded into its measured element table (docs/input_layout.md);
+    // every element field is then proved against the measured values before a D3D12_INPUT_ELEMENT_DESC is built, and
+    // anything not proved refuses by field.
     if (!record.root_signature)
         return fail(why, "record.root_signature: the record has no root signature at +0x00, so the pipeline's "
                          "bindings cannot be established");
@@ -188,16 +210,89 @@ bool build(const rt::graphics_record::Record& record, const GraphicsPsoInputs& i
                          "knows");
     std::vector<rt::graphics_record::Element> elements;
     if (!rt::graphics_record::decode_input_layout(record.input_layout, &elements))
-        return fail(why, "record.input_layout: the input-layout blob does not decode (its element count, its "
-                         "NUL-terminated semantics and its count*28 attribute bytes do not fill the measured 80..340 "
-                         "bytes)");
-    if (!elements.empty()) {
-        const rt::graphics_record::Element& first = elements.front();
-        return fail(why, "input_layout.elements[0].format: the first of " + std::to_string(elements.size()) +
-                             " element(s) (\"" + first.semantic + "\") keeps its 28 attribute bytes raw: the format "
-                             "code is not mapped to a DXGI format and its input slot, aligned byte offset, semantic "
-                             "index and per-vertex flag are undecoded, so no D3D12_INPUT_ELEMENT_DESC can be built");
+        return fail(why, "record.input_layout: the input-layout blob does not decode (its 0x50-byte header, its "
+                         "length-prefixed printable names, its 24-byte attribute blocks and its zero padding do not "
+                         "fill the measured 80..340 bytes; docs/input_layout.md)");
+    if (!elements.empty() && !vertex)
+        return fail(why, "record.stages: the input layout has " + std::to_string(elements.size()) +
+                             " element(s) but the record names no vertex stage; D3D12 requires a vertex shader to "
+                             "consume an input layout");
+    // The decoded elements become D3D12_INPUT_ELEMENT_DESCs through the measured attribute field order
+    // (docs/input_layout.md): the six words are the D3D12_INPUT_ELEMENT_DESC fields in their D3D12 order with the name
+    // pointer replaced by the stored name, i.e. word 0 SemanticIndex, word 1 Format, word 2 InputSlot, word 3
+    // AlignedByteOffset, word 4 InputSlotClass, word 5 InstanceDataStepRate. Word 1 and word 3 are pinned by the
+    // measured values (the formats' sizes are exactly the byte offsets), and word 0 is pinned by the measured COLOR
+    // element whose value is 2 - the COLOR2 semantic index. Every unmeasured value refuses by field, with the value in
+    // the field name so the boot histogram lists it.
+    std::uint32_t input_stride = 0;
+    for (std::size_t index = 0; index < elements.size(); ++index) {
+        const rt::graphics_record::Element& element = elements[index];
+        const std::uint32_t semantic_index = element.attribute[0];
+        const std::uint32_t format_word = element.attribute[1];
+        const std::uint32_t input_slot = element.attribute[2];
+        const std::uint32_t stored_offset = element.attribute[3];
+        const std::uint32_t input_class = element.attribute[4];
+        const std::uint32_t step_rate = element.attribute[5];
+        const InputFormat* format = measured_input_format(format_word);
+        if (!format)
+            return fail(why, element_field(index, "format[" + std::to_string(format_word) + "]") + ": element " +
+                                 std::to_string(index) + " (" + quoted(element.semantic) + ") stores format word " +
+                                 std::to_string(format_word) +
+                                 ", which is not one of the measured DXGI format values 2, 6, 16, 28 and 30 "
+                                 "(docs/input_layout.md), so no D3D12_INPUT_ELEMENT_DESC can be built for it");
+        if (input_slot != 0)
+            return fail(why, element_field(index, "input_slot[" + std::to_string(input_slot) + "]") + ": element " +
+                                 std::to_string(index) + " (" + quoted(element.semantic) + ") stores input slot " +
+                                 std::to_string(input_slot) +
+                                 "; every measured element is in slot 0, so the slot is not mapped");
+        if (input_class != 0)
+            return fail(why, element_field(index, "input_slot_class[" + std::to_string(input_class) + "]") +
+                                 ": element " + std::to_string(index) + " (" + quoted(element.semantic) +
+                                 ") stores input-slot class " + std::to_string(input_class) +
+                                 "; every measured element is per-vertex data (class 0), so the class is not mapped");
+        if (step_rate != 0)
+            return fail(why, element_field(index, "instance_step_rate[" + std::to_string(step_rate) + "]") +
+                                 ": element " + std::to_string(index) + " (" + quoted(element.semantic) +
+                                 ") stores instance step rate " + std::to_string(step_rate) +
+                                 "; every measured element has step rate 0, so it is not mapped");
+        // D3D12 takes AlignedByteOffset verbatim and the description carries no stride, so a measured gap between two
+        // elements is emitted as stored - the post-decode boot has an 188-byte shape with COLOR at offset 24 after a
+        // 12-byte POSITION. Only an overlap with the preceding elements' measured sizes is refused.
+        if (stored_offset == D3D12_APPEND_ALIGNED_ELEMENT)
+            return fail(why, element_field(index, "aligned_byte_offset[" + std::to_string(stored_offset) + "]") +
+                                 ": element " + std::to_string(index) + " (" + quoted(element.semantic) +
+                                 ") stores the D3D12_APPEND_ALIGNED_ELEMENT sentinel as its offset; no measured "
+                                 "element uses the sentinel, so the offset is not mapped");
+        if (stored_offset < input_stride)
+            return fail(why, element_field(index, "aligned_byte_offset[" + std::to_string(stored_offset) + "]") +
+                                 ": element " + std::to_string(index) + " (" + quoted(element.semantic) +
+                                 ") stores offset " + std::to_string(stored_offset) +
+                                 ", which overlaps the elements before it: they occupy " +
+                                 std::to_string(input_stride) +
+                                 " bytes at the measured format sizes and every measured layout is non-overlapping, "
+                                 "so this blob is not the measured shape and no D3D12_INPUT_ELEMENT_DESC is built "
+                                 "from it");
+        for (std::size_t earlier = 0; earlier < index; ++earlier) {
+            if (elements[earlier].semantic != element.semantic || elements[earlier].attribute[0] != semantic_index)
+                continue;
+            return fail(why, element_field(index, "semantic_index[" + std::to_string(semantic_index) + "]") +
+                                 ": element " + std::to_string(index) + " (" + quoted(element.semantic) +
+                                 ") repeats the semantic index of element " + std::to_string(earlier) +
+                                 "; D3D12 needs a unique semantic name and index per element, so the duplicate is "
+                                 "refused rather than built");
+        }
+        D3D12_INPUT_ELEMENT_DESC& desc = g_input_elements[index];
+        desc = {};
+        desc.SemanticName = reinterpret_cast<const char*>(record.input_layout.data + element.semantic_offset);
+        desc.SemanticIndex = semantic_index;
+        desc.Format = format->dxgi;
+        desc.InputSlot = input_slot;  // 0: the only measured slot
+        desc.AlignedByteOffset = stored_offset;
+        desc.InputSlotClass = D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA;  // measured class word 0
+        desc.InstanceDataStepRate = 0;                                     // measured step-rate word 0
+        input_stride += format->bytes;
     }
+    const std::size_t input_element_count = elements.size();
 
     // ---- The caller's inputs. Each is checked by name; build() substitutes nothing.
     if (!inputs.root_signature)
@@ -292,9 +387,14 @@ bool build(const rt::graphics_record::Record& record, const GraphicsPsoInputs& i
     desc.SampleMask = ff.sample_mask;
     desc.RasterizerState = ff.rasterizer;
     desc.DepthStencilState = ff.depth_stencil;
-    // An empty input layout: the decoder proved the element count is zero (any element was refused above). The
-    // pointer must stay null for NumElements 0, which is what the caller sees a mesh-less fullscreen pipeline use.
-    desc.InputLayout = {nullptr, 0};
+    // An empty input layout stays a null array with NumElements 0 (the 1,074 fullscreen-style records the
+    // measurement built). A layout with elements points at the per-thread descriptions build() just filled; see the
+    // lifetime note in graphics_pso.h.
+    if (input_element_count == 0) {
+        desc.InputLayout = {nullptr, 0};
+    } else {
+        desc.InputLayout = {g_input_elements.data(), static_cast<UINT>(input_element_count)};
+    }
     desc.IBStripCutValue = ff.strip_cut;
     desc.PrimitiveTopologyType = ff.topology_type;
     desc.NumRenderTargets = inputs.render_target_count;
