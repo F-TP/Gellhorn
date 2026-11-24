@@ -964,6 +964,12 @@ public:
         replay_.dispatch = vk.vkCmdDispatch;
         replay_.compute_pipeline = [this](std::uintptr_t id) -> const ComputePipeline* {
             const auto it = pipelines_.find(id);
+            if (it == pipelines_.end()) {
+                static std::atomic<unsigned> misses{0};
+                if (misses.fetch_add(1, std::memory_order_relaxed) < 6)
+                    std::fprintf(stderr, "[rt] replay: compute pipeline map miss for id 0x%llx (%zu registered)\n",
+                                 static_cast<unsigned long long>(id), pipelines_.size());
+            }
             return it == pipelines_.end() ? nullptr : &it->second;
         };
         replay_.bind_vertex_buffers2 = vk.vkCmdBindVertexBuffers2;
@@ -979,6 +985,13 @@ public:
         replay_.draw_indexed = vk.vkCmdDrawIndexed;
         replay_.graphics_pipeline = [this](std::uintptr_t id) -> const GraphicsPipeline* {
             const auto it = graphics_pipelines_.find(id);
+            if (it == graphics_pipelines_.end()) {
+                static std::atomic<unsigned> misses{0};
+                if (misses.fetch_add(1, std::memory_order_relaxed) < 6)
+                    std::fprintf(stderr,
+                                 "[rt] replay: graphics pipeline map miss for id 0x%llx (%zu registered)\n",
+                                 static_cast<unsigned long long>(id), graphics_pipelines_.size());
+            }
             return it == graphics_pipelines_.end() ? nullptr : &it->second;
         };
         // Called with resource_mutex_ held. A binary search of the buffers' VA ranges (buffer_va_index.h), kept in step
@@ -987,9 +1000,21 @@ public:
         // buffer as out of bounds, which is no reason to drop the submission.
         replay_.buffer_at = [this](std::uint64_t va, std::uint64_t& size, VkBuffer& buffer, VkDeviceSize& offset) {
             BufferVaIndex<ResourceId>::Hit hit{};
-            if (!buffer_vas_.find(va, hit, size)) return false;  // prefers an aliasing buffer that holds all of it
+            if (!buffer_vas_.find(va, hit, size)) {
+                static std::atomic<unsigned> misses{0};
+                if (misses.fetch_add(1, std::memory_order_relaxed) < 6)
+                    std::fprintf(stderr, "[rt] replay: buffer_at miss for VA 0x%llx size 0x%llx\n",
+                                 static_cast<unsigned long long>(va), static_cast<unsigned long long>(size));
+                return false;  // prefers an aliasing buffer that holds all of it
+            }
             const ResourceBinding* b = resolve(hit.id);
-            if (!b) return false;
+            if (!b) {
+                static std::atomic<unsigned> misses{0};
+                if (misses.fetch_add(1, std::memory_order_relaxed) < 6)
+                    std::fprintf(stderr, "[rt] replay: buffer_at hit has no binding for id 0x%llx\n",
+                                 static_cast<unsigned long long>(hit.id));
+                return false;
+            }
             buffer = b->buffer;
             offset = b->buffer_offset + (va - b->va);
             size = std::min<std::uint64_t>(size, b->size - (va - b->va));
@@ -1289,6 +1314,15 @@ public:
         graphics_pipelines_.erase(id);
     }
     void add_graphics_pipeline(std::uintptr_t id, const GraphicsPipeline& pipeline) {
+        {
+            static std::atomic<unsigned> logged{0};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 8)
+                std::fprintf(stderr,
+                             "[rt] replay: graphics pipeline registered id 0x%llx (%zu colours, depth %d)\n",
+                             static_cast<unsigned long long>(id),
+                             static_cast<unsigned long long>(pipeline.color_formats.size()),
+                             pipeline.depth_format != VK_FORMAT_UNDEFINED ? 1 : 0);
+        }
         std::unique_lock lock(resource_mutex_);
         graphics_pipelines_[id] = pipeline;
     }
@@ -1512,6 +1546,9 @@ public:
 
     void mark_device_lost() noexcept {
         device_lost_.store(true, std::memory_order_release);
+        static std::atomic<unsigned> logged{0};
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 3)
+            std::fprintf(stderr, "[rt] replay: the Vulkan device was lost\n");
         if (fence_dispatcher_) {
             try {
                 fence_dispatcher_->notify_device_lost();
@@ -2403,12 +2440,28 @@ private:
                 occlusion_resolve_->sum_binary(cb, pool, first, count, dst, offset);
             };
         }
-        const auto resolve = [this](ResourceId id) { return context_.resolve(id); };
+        const auto resolve = [this](ResourceId id) {
+            const ResourceBinding* binding = context_.resolve(id);
+            if (!binding && id) {
+                static std::atomic<unsigned> misses{0};
+                if (misses.fetch_add(1, std::memory_order_relaxed) < 12)
+                    std::fprintf(stderr, "[rt] replay: resource map miss for id 0x%llx\n",
+                                 static_cast<unsigned long long>(id));
+            }
+            return binding;
+        };
         std::uint32_t segments = 0, statistics_segments = 0;
         bool has_queries = false;
         for (std::size_t i = 0; i < lists.size(); ++i) {
             const auto result = prepare(*lists[i], resolve, replay, prepared[i], can_resolve_occlusion);
-            if (result != ReplayResult::success) return result;
+            if (result != ReplayResult::success) {
+                static std::atomic<unsigned> refusals{0};
+                if (refusals.fetch_add(1, std::memory_order_relaxed) < 8)
+                    std::fprintf(stderr,
+                                 "[rt] replay: list %zu of %zu refused in prepare: result %d, %zu command(s)\n", i,
+                                 lists.size(), int(result), lists[i]->commands().size());
+                return result;
+            }
             if (prepared[i].segment_count > UINT32_MAX - segments ||
                 prepared[i].statistics_segment_count > UINT32_MAX - statistics_segments)
                 return ReplayResult::unsupported;
@@ -3202,6 +3255,11 @@ private:
             context_.mark_device_lost();
             clear_waits();
             return false;
+        }
+        if (res != VK_SUCCESS) {
+            static std::atomic<unsigned> logged{0};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 3)
+                std::fprintf(stderr, "[rt] replay: vkQueueSubmit failed with VkResult %d\n", int(res));
         }
         const bool ok = (res == VK_SUCCESS);
         if (ok) {

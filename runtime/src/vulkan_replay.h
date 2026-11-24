@@ -43,10 +43,13 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <functional>
 #include <limits>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <type_traits>
 #include <unordered_map>
 #include <utility>
@@ -802,6 +805,46 @@ enum class ReplayResult {
     invalid_draw,  // DispatchMesh with a pipeline that has no mesh shader, or a vertex draw with one that has
     unsupported
 };
+
+// A submission was refused because a binding did not resolve to a resource the replay layer knows. The whole list is
+// dropped (d3d12_com.cpp, "nothing was submitted"), so which check refused and which id it could not resolve is what
+// a boot has to report: the id is the D3D12 object pointer (pipeline) or the console VA (buffer) the command named.
+// The first few per site print, then a count; LEONIDA_REPLAY_MISS=0 silences them. Diagnostic only: no call changes.
+inline ReplayResult unresolved_at(const char* site, std::uint64_t id = 0, std::uint64_t extra = 0) {
+    struct Note {
+        const char* site;
+        unsigned printed;
+    };
+    static Note notes[32];
+    static unsigned sites = 0;
+    static std::mutex mutex;
+    static const bool enabled = [] {
+        const char* value = std::getenv("LEONIDA_REPLAY_MISS");
+        return !value || value[0] == '\0' || (value[0] != '0' && value[0] != 'n');
+    }();
+    if (enabled) {
+        std::lock_guard lock(mutex);
+        Note* note = nullptr;
+        for (unsigned i = 0; i < sites; ++i) {
+            if (notes[i].site != site) continue;
+            note = &notes[i];
+            break;
+        }
+        if (!note && sites < std::size(notes)) note = &notes[sites++];
+        if (note) {
+            const unsigned kPerSite = 3;
+            if (note->printed < kPerSite) {
+                note->site = site;
+                std::fprintf(stderr, "[rt] replay: unresolved resource at %s: id 0x%llx, extra 0x%llx\n", site,
+                             static_cast<unsigned long long>(id), static_cast<unsigned long long>(extra));
+                const bool last = note->printed + 1 == kPerSite;
+                if (last) std::fprintf(stderr, "[rt] replay: %s: further misses are counted silently\n", site);
+            }
+            ++note->printed;
+        }
+    }
+    return ReplayResult::unresolved_resource;
+}
 
 struct ReplayFunctions {
     // Set 0 for the pipelines that declare one (their own `bindless_set` is only the marker): the device's current
@@ -2100,7 +2143,7 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
         !vk.draw_indexed || !vk.bind_pipeline || !vk.push_constants)
         return ReplayResult::unsupported;
     const GraphicsPipeline* pipeline = vk.graphics_pipeline(draw.pipeline);
-    if (!pipeline || !pipeline->pipeline) return ReplayResult::unresolved_resource;
+    if (!pipeline || !pipeline->pipeline) return unresolved_at("draw.pipeline", draw.pipeline);
     if (pipeline->mesh != draw.mesh) return ReplayResult::invalid_draw;
     if (draw.mesh && !vk.draw_mesh_tasks) return ReplayResult::unsupported;
     if (pipeline->bindless_set && !vk.bind_descriptor_sets) return ReplayResult::unsupported;
@@ -2121,7 +2164,7 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
         const TargetView& target = draw.views->render_targets[slot];
         if (!target.resource) continue;
         const ResourceBinding* binding = resolve(target.resource);
-        if (!binding) return ReplayResult::unresolved_resource;
+        if (!binding) return unresolved_at("draw.render_target", target.resource, slot);
         auto& a = p.colors[slot];
         a.binding = *binding;
         a.id = target.resource;
@@ -2138,7 +2181,7 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
     }
     if (draw.depth.resource && pipeline->depth_format != VK_FORMAT_UNDEFINED) {
         const ResourceBinding* binding = resolve(draw.depth.resource);
-        if (!binding) return ReplayResult::unresolved_resource;
+        if (!binding) return unresolved_at("draw.depth", draw.depth.resource);
         auto& a = p.depth;
         a.binding = *binding;
         a.id = draw.depth.resource;
@@ -2179,7 +2222,7 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
         const bool bound = draw.views && slot < draw.views->vertex_buffers.size() &&
                            draw.views->vertex_buffers[slot].va;
         if (!bound) {
-            if (!vk.zero_buffer) return ReplayResult::unresolved_resource;
+            if (!vk.zero_buffer) return unresolved_at("draw.vertex_zero_page", slot);
             p.vertex_buffers[slot] = vk.zero_buffer;
             p.vertex_offsets[slot] = vk.zero_offset;
             p.vertex_sizes[slot] = vk.zero_size;
@@ -2189,7 +2232,7 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
         const VertexBufferView& view = draw.views->vertex_buffers[slot];
         std::uint64_t size = view.size;
         if (!vk.buffer_at(view.va, size, p.vertex_buffers[slot], p.vertex_offsets[slot]))
-            return ReplayResult::unresolved_resource;
+            return unresolved_at("draw.vertex_buffer", view.va, view.size);
         p.vertex_sizes[slot] = size;
         p.vertex_strides[slot] = (pipeline->zero_step_slots & (1u << slot)) ? 0 : view.stride;
     }
@@ -2198,13 +2241,13 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
         else if (draw.index.format == 42) p.index_type = VK_INDEX_TYPE_UINT32;
         else if (draw.index.va) return ReplayResult::unsupported;
         if (!draw.index.va) {  // no index buffer: every index reads 0
-            if (!vk.zero_buffer) return ReplayResult::unresolved_resource;
+            if (!vk.zero_buffer) return unresolved_at("draw.index_zero_page", 0);
             p.index_buffer = vk.zero_buffer;
             p.index_offset = vk.zero_offset;
         } else {
             std::uint64_t size = draw.index.size;
             if (!vk.buffer_at(draw.index.va, size, p.index_buffer, p.index_offset))
-                return ReplayResult::unresolved_resource;
+                return unresolved_at("draw.index_buffer", draw.index.va, draw.index.size);
         }
     }
     return ReplayResult::success;
