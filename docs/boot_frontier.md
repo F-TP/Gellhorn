@@ -378,3 +378,21 @@ argument from `[rsi+0x60]`, and the first qword there is zero.
 
 This is also a policy question for `LEONIDA_SKIP_INT3`: for a trap that follows a null check, stopping at the trap is more
 informative than stepping over it, because the trap site is the title's own statement of what went wrong.
+
+
+## Frontier 2026-11-24 (refusals at the null stop)
+
+Counted in one boot at the `game+0xcc2861` stop. The dominant gap is not a slot arity question but an interface the title
+creates constantly:
+
+| refusal | calls |
+|---|---|
+| `ID3D12Device5::CreateLifetimeTracker` returns `E_NOTIMPL` | 10,242 |
+| allocator slot 9 past the PC allocator table | 2 |
+| queue slot 32 past the PC queue table | 2 |
+| `ID3D12GraphicsCommandList::Close` failed | 1 |
+
+Every `CreateLifetimeTracker` call leaves the title with a null tracker, and the current stop is the title's own null
+pointer, so a tracker object is the first thing to rule in or out: an earlier prototype regressed the boot (D3D12 calls
+11,894 -> 1,653) through a wrong vtable slot, which means the interface order must be exact, and the run has to be
+compared against 11,986 calls and the `game+0xcc2861` stop before the change is kept.
