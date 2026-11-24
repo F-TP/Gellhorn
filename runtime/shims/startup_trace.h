@@ -208,8 +208,7 @@ inline void log_exception(const EXCEPTION_POINTERS& info) {
             }
             if (r.ExceptionCode == kCppException) f += ",\"cpp\":true";
             if (info.ContextRecord) {
-                f += ",\"stack\":" + stack_from(*info.ContextRecord);
-                // LEONIDA_DUMP_REGS=1: the argument registers at the fault. A stop whose stack frame looks impossible
+                f += ",\"stack\":" + stack_from(*info.ContextRecord);                // LEONIDA_DUMP_REGS=1: the argument registers at the fault. A stop whose stack frame looks impossible
                 // (a null test that should have branched) is usually a jump into a shared tail, and the registers say
                 // which values the failing instruction actually saw.
                 static const bool dump_regs = GetEnvironmentVariableW(L"LEONIDA_DUMP_REGS", nullptr, 0) != 0;
@@ -226,6 +225,64 @@ inline void log_exception(const EXCEPTION_POINTERS& info) {
                          ",\"rax\":" + quote(hex(c.Rax)) + ",\"r10\":" + quote(hex(c.R10)) +
                          ",\"r11\":" + quote(hex(c.R11));
                     f += "}";
+                    // LEONIDA_FAULT_MEM=1: the memory the faulting instruction was using, not just the registers. A
+                    // value that looks wrong in a register is either an object field or the raw argument; reading the
+                    // surrounding bytes tells those apart (a clobbered first qword with intact neighbours is an
+                    // object, a run of size-like words is a buffer). rcx and the other argument registers are dumped;
+                    // unmapped or guarded ranges are skipped instead of faulting inside the handler.
+                    static const bool dump_mem = GetEnvironmentVariableW(L"LEONIDA_FAULT_MEM", nullptr, 0) != 0;
+                    if (dump_mem) {
+                        struct Region {
+                            const char* name;
+                            DWORD64 address;
+                            int bytes;
+                        };
+                        const Region regions[] = {
+                            {"rcx", c.Rcx, 0x100}, {"rcx_before", c.Rcx - 0x40, 0x40},
+                            {"rdx", c.Rdx, 0x40},  {"r8", c.R8, 0x40},     {"r9", c.R9, 0x40},
+                            {"rdi", c.Rdi, 0x40},  {"rsi", c.Rsi, 0x40},   {"r14", c.R14, 0x40},
+                            {"r15", c.R15, 0x40},  {"rsp", c.Rsp, 0x80},   {"rax", c.Rax, 0x40},
+                        };
+                        static const char digits[] = "0123456789abcdef";
+                        bool first_region = true;
+                        auto append_region = [&](const char* name, DWORD64 address, int requested) {
+                            MEMORY_BASIC_INFORMATION mbi{};
+                            if (!address ||
+                                VirtualQuery(reinterpret_cast<const void*>(address), &mbi, sizeof(mbi)) != sizeof(mbi) ||
+                                mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)))
+                                return;
+                            const DWORD64 region_end = reinterpret_cast<DWORD64>(mbi.BaseAddress) + mbi.RegionSize;
+                            int n = requested;
+                            if (address + static_cast<DWORD64>(n) > region_end)
+                                n = static_cast<int>(region_end - address);
+                            std::string bytes;
+                            bytes.reserve(static_cast<size_t>(n) * 2);
+                            const auto* p = reinterpret_cast<const unsigned char*>(address);
+                            for (int b = 0; b < n; ++b) {
+                                bytes += digits[p[b] >> 4];
+                                bytes += digits[p[b] & 15];
+                            }
+                            f += first_region ? ",\"mem\":{" : ",";
+                            first_region = false;
+                            f += quote(name) + ":{\"addr\":" + quote(hex(address)) + ",\"hex\":" + quote(bytes) + "}";
+                        };
+                        for (const Region& region : regions) append_region(region.name, region.address, region.bytes);
+                        // LEONIDA_FAULT_MEM_RVA=<hex rva>[,<hex rva>...]: image-relative windows, for a structure the
+                        // fault depends on but no register points at (a singleton whose field holds the bad object).
+                        if (detail::crash_image_base()) {
+                            const char* list = std::getenv("LEONIDA_FAULT_MEM_RVA");
+                            char name[24];
+                            for (int slot = 0; list && *list && slot < 4; ++slot) {
+                                char* end = nullptr;
+                                const auto rva = std::strtoull(list, &end, 16);
+                                if (end == list) break;
+                                std::snprintf(name, sizeof(name), "rva_%llx", static_cast<unsigned long long>(rva));
+                                append_region(name, reinterpret_cast<DWORD64>(detail::crash_image_base()) + rva, 0x100);
+                                list = (*end == ',') ? end + 1 : "";
+                            }
+                        }
+                        if (!first_region) f += "}";
+                    }
                     // The first eight TlsAlloc cells of this thread and the first qword each points at: a mapped image's
                     // index-0 TLS reads go through one of them (the loader's view), so a wrong view or view[0] shows up
                     // here next to the faulting registers.
@@ -284,6 +341,211 @@ inline void log_exception(const EXCEPTION_POINTERS& info) {
 inline std::uintptr_t& repoke_address() {
     static thread_local std::uintptr_t address = 0;
     return address;
+}
+
+// LEONIDA_WATCH_RVA_WRITE=<hex rva>: name the writer of an image global a later fault depends on. The mapped image's
+// 4 KiB page that holds that rva is made read-only; every store into it faults, is logged with the store instruction
+// (module+rva) and registers, is single-stepped with the page writable, and the page is protected again on the step.
+// This is how the store that put a heap pointer into a channel field was named; it stays on the image's own pages, which
+// belong to nobody but the title, so the trap cannot re-enter the runtime's allocator.
+inline std::uintptr_t& watch_a_page() {
+    static std::uintptr_t page = 0;
+    return page;
+}
+inline std::uintptr_t& watch_a_cell() {
+    static std::uintptr_t cell = 0;
+    return cell;
+}
+// The three pending values are per-thread: the watch traps on any guest thread, and a shared copy would let two
+// threads' faults overwrite each other's single-step bookkeeping (a stray trap flag then surfaces as an unhandled
+// single step in host code).
+inline std::uintptr_t& watch_pending_page() {
+    static thread_local std::uintptr_t page = 0;
+    return page;
+}
+inline std::uintptr_t& watch_pending_address() {
+    static thread_local std::uintptr_t address = 0;
+    return address;
+}
+inline std::uintptr_t& watch_pending_rip() {
+    static thread_local std::uintptr_t rip = 0;
+    return rip;
+}
+
+inline void setup_watch_write() {
+    const char* spec = std::getenv("LEONIDA_WATCH_RVA_WRITE");
+    if (!spec || !crash_image_base()) return;
+    const auto rva = std::strtoull(spec, nullptr, 16);
+    const auto cell = reinterpret_cast<std::uintptr_t>(crash_image_base()) + rva;
+    const std::uintptr_t page = cell & ~static_cast<std::uintptr_t>(0xFFF);
+    DWORD old = 0;
+    if (!VirtualProtect(reinterpret_cast<void*>(page), 0x1000, PAGE_READONLY, &old)) {
+        std::fprintf(stderr, "[rt] watch write: image+0x%llx page is not writable (%lu)\n",
+                     static_cast<unsigned long long>(rva), GetLastError());
+        return;
+    }
+    watch_a_page() = page;
+    watch_a_cell() = cell;
+    std::fprintf(stderr, "[rt] watching writes to image+0x%llx..0x%llx (cell image+0x%llx at %p)\n",
+                 static_cast<unsigned long long>(page - reinterpret_cast<std::uintptr_t>(crash_image_base())),
+                 static_cast<unsigned long long>(page + 0xFFF - reinterpret_cast<std::uintptr_t>(crash_image_base())),
+                 static_cast<unsigned long long>(rva), reinterpret_cast<void*>(cell));
+}
+
+inline std::string hex_bytes(const void* address, int bytes) {
+    static const char digits[] = "0123456789abcdef";
+    std::string out;
+    const auto* p = static_cast<const unsigned char*>(address);
+    out.reserve(static_cast<size_t>(bytes) * 2);
+    for (int i = 0; i < bytes; ++i) {
+        out += digits[p[i] >> 4];
+        out += digits[p[i] & 15];
+    }
+    return out;
+}
+
+inline bool readable_range(std::uintptr_t address, int bytes) {
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (!address || VirtualQuery(reinterpret_cast<const void*>(address), &mbi, sizeof(mbi)) != sizeof(mbi) ||
+        mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)))
+        return false;
+    const std::uintptr_t end = reinterpret_cast<std::uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+    return address + static_cast<std::uintptr_t>(bytes) <= end;
+}
+
+inline std::string all_regs(const CONTEXT& c) {
+    return "\"rip\":" + quote(where(c.Rip)) + ",\"rcx\":" + quote(hex(c.Rcx)) + ",\"rdx\":" + quote(hex(c.Rdx)) +
+           ",\"r8\":" + quote(hex(c.R8)) + ",\"r9\":" + quote(hex(c.R9)) + ",\"rax\":" + quote(hex(c.Rax)) +
+           ",\"rbx\":" + quote(hex(c.Rbx)) + ",\"rsi\":" + quote(hex(c.Rsi)) + ",\"rdi\":" + quote(hex(c.Rdi)) +
+           ",\"r10\":" + quote(hex(c.R10)) + ",\"r11\":" + quote(hex(c.R11)) + ",\"r12\":" + quote(hex(c.R12)) +
+           ",\"r13\":" + quote(hex(c.R13)) + ",\"r14\":" + quote(hex(c.R14)) + ",\"r15\":" + quote(hex(c.R15));
+}
+
+// Returns true when it handled the exception (a write fault in the watched page, or the single-step that follows one).
+inline bool handle_watch_write(EXCEPTION_POINTERS* info) {
+    if (!info->ExceptionRecord || !info->ContextRecord) return false;
+    if (!watch_a_page()) return false;
+    CONTEXT& c = *info->ContextRecord;
+    if (info->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION &&
+        info->ExceptionRecord->NumberParameters >= 2 && info->ExceptionRecord->ExceptionInformation[0] == 1) {
+        const auto address = static_cast<std::uintptr_t>(info->ExceptionRecord->ExceptionInformation[1]);
+        if (address < watch_a_page() || address >= watch_a_page() + 0x1000) return false;
+        watch_pending_page() = watch_a_page();
+        watch_pending_address() = address;
+        watch_pending_rip() = static_cast<std::uintptr_t>(c.Rip);
+        if (address == watch_a_cell())
+            std::fprintf(stderr, "[rt] watch write cell: store at %s\n", where(c.Rip).c_str());
+        event("watch_write", "\"address\":" + quote(hex(address)) + "," + all_regs(c));
+        DWORD old = 0;
+        VirtualProtect(reinterpret_cast<void*>(watch_a_page()), 0x1000, PAGE_READWRITE, &old);
+        c.EFlags |= 0x100;   // trap after the store, so the page can be protected again
+        return true;
+    }
+    if (info->ExceptionRecord->ExceptionCode == EXCEPTION_SINGLE_STEP && watch_pending_page()) {
+        const std::uintptr_t page = watch_pending_page();
+        const std::uintptr_t address = watch_pending_address();
+        const std::uintptr_t rip = watch_pending_rip();
+        watch_pending_page() = 0;
+        watch_pending_address() = 0;
+        watch_pending_rip() = 0;
+        c.EFlags &= ~static_cast<DWORD>(0x100);
+        DWORD old = 0;
+        VirtualProtect(reinterpret_cast<void*>(page), 0x1000, PAGE_READONLY, &old);
+        if (address == watch_a_cell()) {
+            const auto pointed = *reinterpret_cast<std::uint64_t*>(address);
+            std::string f = "\"at\":" + quote(where(address)) + ",\"rip\":" + quote(where(rip)) +
+                            ",\"value\":" + quote(hex(pointed));
+            if (readable_range(static_cast<std::uintptr_t>(pointed), 0x40))
+                f += ",\"memory\":" + quote(
+                         hex_bytes(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(pointed)), 0x40));
+            event("watch_write_cell", f);
+        }
+        return true;
+    }
+    // A single step with no per-thread pending record is one of ours whose record a sibling thread could not see
+    // (or a replayed step): clear the trap flag instead of reporting it as a guest fault.
+    if (info->ExceptionRecord->ExceptionCode == EXCEPTION_SINGLE_STEP && (c.EFlags & 0x100)) {
+        c.EFlags &= ~static_cast<DWORD>(0x100);
+        return true;
+    }
+    return false;
+}
+
+// LEONIDA_POKE_HOST=<hex rva>[,<hex rva>...]: the same one-shot probe, but in the runtime's own image rather than the
+// guest's (rva from gta6rt.exe's base). A host function that writes a value the guest later dereferences can be caught
+// exactly: the registers say what it was about to write and the guest's stack words above it name the guest call site.
+inline std::uintptr_t* host_poke_addresses() {
+    static std::uintptr_t addresses[4] = {};
+    return addresses;
+}
+inline unsigned char* host_poke_originals() {
+    static unsigned char originals[4] = {};
+    return originals;
+}
+inline void setup_host_pokes() {
+    const char* spec = std::getenv("LEONIDA_POKE_HOST");
+    if (!spec) return;
+    const auto base = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
+    for (unsigned slot = 0; slot < 4 && *spec; ++slot) {
+        char* end = nullptr;
+        const auto rva = std::strtoull(spec, &end, 16);
+        if (end == spec) break;
+        const auto address = base + rva;
+        DWORD old = 0;
+        if (VirtualProtect(reinterpret_cast<void*>(address), 1, PAGE_EXECUTE_READWRITE, &old)) {
+            host_poke_addresses()[slot] = address;
+            host_poke_originals()[slot] = *reinterpret_cast<unsigned char*>(address);
+            *reinterpret_cast<unsigned char*>(address) = 0xCC;
+            VirtualProtect(reinterpret_cast<void*>(address), 1, old, &old);
+            std::fprintf(stderr, "[rt] host poke at gta6rt.exe+0x%llx (%p)\n",
+                         static_cast<unsigned long long>(rva), reinterpret_cast<void*>(address));
+        } else {
+            std::fprintf(stderr, "[rt] host poke at gta6rt.exe+0x%llx failed (%lu)\n",
+                         static_cast<unsigned long long>(rva), GetLastError());
+        }
+        spec = (*end == ',') ? end + 1 : "";
+    }
+}
+
+inline bool handle_host_poke(EXCEPTION_POINTERS* info) {
+    if (!info->ExceptionRecord || !info->ContextRecord) return false;
+    if (info->ExceptionRecord->ExceptionCode != EXCEPTION_BREAKPOINT) return false;
+    const auto at = reinterpret_cast<std::uintptr_t>(info->ExceptionRecord->ExceptionAddress);
+    for (unsigned slot = 0; slot < 4; ++slot) {
+        if (host_poke_addresses()[slot] != at) continue;
+        CONTEXT& c = *info->ContextRecord;
+        std::fprintf(stderr, "[rt] host poke hit: gta6rt.exe+0x%llx rax=%llx rcx=%llx rdx=%llx r8=%llx r9=%llx\n",
+                     static_cast<unsigned long long>(at - reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr))),
+                     static_cast<unsigned long long>(c.Rax), static_cast<unsigned long long>(c.Rcx),
+                     static_cast<unsigned long long>(c.Rdx), static_cast<unsigned long long>(c.R8),
+                     static_cast<unsigned long long>(c.R9));
+        // The guest stack above this host frame: the return address of the guest's indirect call through the proxy
+        // vtable is one of these words. Image words are named, the rest are raw, so the caller can be disassembled.
+        const auto image = reinterpret_cast<std::uintptr_t>(crash_image_base());
+        const auto image_end = image + crash_image_size();
+        std::string stack = "\"stack\":[";
+        const auto* words = reinterpret_cast<const std::uint64_t*>(static_cast<std::uintptr_t>(c.Rsp));
+        for (int i = 0; i < 192; ++i) {
+            const std::uint64_t word = words[i];
+            if (i) stack += ',';
+            if (word >= image && word < image_end)
+                stack += quote(where(word));
+            else
+                stack += quote(hex(word));
+        }
+        stack += "]";
+        event("host_poke", "\"at\":" + quote(where(at)) + "," + all_regs(c) + "," + stack);
+        // Restore this instruction byte and single-step it, then put the probe back (the repoke path does that).
+        DWORD old = 0;
+        if (VirtualProtect(reinterpret_cast<void*>(at), 1, PAGE_EXECUTE_READWRITE, &old)) {
+            *reinterpret_cast<unsigned char*>(at) = host_poke_originals()[slot];
+            VirtualProtect(reinterpret_cast<void*>(at), 1, old, &old);
+        }
+        repoke_address() = at;
+        c.EFlags |= 0x100;
+        return true;
+    }
+    return false;
 }
 
 inline bool handle_repoke(EXCEPTION_POINTERS* info) {
@@ -533,6 +795,8 @@ inline bool skip_int3(EXCEPTION_POINTERS* info) {
 }
 
 inline LONG CALLBACK handler(EXCEPTION_POINTERS* info) {
+    if (handle_watch_write(info)) return EXCEPTION_CONTINUE_EXECUTION;
+    if (handle_host_poke(info)) return EXCEPTION_CONTINUE_EXECUTION;
     if (handle_repoke(info)) return EXCEPTION_CONTINUE_EXECUTION;
     if (emulate_amd_instruction(info)) return EXCEPTION_CONTINUE_EXECUTION;
     if (!enabled() || in_handler || !info || !info->ExceptionRecord) return EXCEPTION_CONTINUE_SEARCH;
@@ -565,6 +829,8 @@ inline void set_crash_image(void* base, std::size_t size, const void* functions,
     detail::crash_image_size() = size;
     detail::crash_image_functions() = functions;
     detail::crash_image_function_count() = count;
+    detail::setup_watch_write();
+    detail::setup_host_pokes();
 }
 
 inline void set_poke_log(const std::uintptr_t* addresses, const unsigned char* originals, unsigned count) {

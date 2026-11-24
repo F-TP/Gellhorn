@@ -41,14 +41,14 @@ clean-room approach, plus the boot fixes measured on this machine.
 | Slot-57 calls per boot (deserialized graphics records) | 10,242 |
 | Distinct graphics programs behind them | 1,264 (945 PS, 319 VS) |
 | Stand-in effect on the stop | none (same instruction, same null) |
-| Highest traced D3D12 call (after the A8 fix) | 12,085 |
 | A8 render-target formats refused | 0 (was 1 per factory call) |
+| Highest traced D3D12 call (after the queue slot shift) | 12,087 |
 
-**Where it stops now:** `game+0x4fb0aec` - a call through a garbage vtable: the object holds 0x3b9aca00 (10^9) where its vtable pointer belongs, and the call target computes to 0x3b9aca60. This is past the A8 render-target fix, which moved the boot from game+0xcc2861 and raised the traced-call count from 11,986 to 12,085. Next: find who wrote a value that looks like a size into the object's first qword.
+**Where it stops now:** `game+0x4fb0b03` - the console queue inserts two methods before Signal, so console slots 16..20 are PC 14..18; forwarding by number had sent console Signal into PC GetTimestampFrequency, which wrote our 1e9 frequency answer over a fence proxy's first qword. That is fixed and measured (12,085 -> 12,087 traced calls, stop moved). The new stop is console fence slot 12: the caller dereferences its result and compares with -1, the shape of 'address of the value being waited on, -1 = not ready'.
 Measurements and the method behind them: [docs/boot_frontier.md](docs/boot_frontier.md).
 
 Next up:
-- find the writer of the 10^9 value in the object's vtable slot at game+0x4fb0aec
+- identify and implement console fence slot 12 (its result is dereferenced; -1 means not ready)
 - convert slot-57 records into real pipelines for rendering (needed, measured not to be the boot blocker)
 - fix the shader stage's two-shader completeness gate and the quadratic llvm-mc listings
 

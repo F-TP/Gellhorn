@@ -516,3 +516,31 @@ game+0x23cf363.
 a sentinel that a structure layout put at offset 0. The next step is to find the writer: either our shim wrote a 64-bit
 size where the title's object expects a vtable pointer (a layout mismatch in an answered call), or the title stored a
 sentinel that a class slot is expected to test before calling.
+
+
+## Frontier 2026-11-24 (the queue's console slot shift, and the fence slot it exposed)
+
+The garbage vtable at the previous stop was ours: the console queue inserts **two methods before Signal**
+(docs/d3d12_xs_surface.md already recorded the public PresentX slot-30/32 split that way), so console slots 16..20 name
+PC slots 14..18. The proxy forwarded console slot numbers unchanged, so console **Signal (16)** landed in PC
+**GetTimestampFrequency (16)**, whose out pointer was the fence the title passed - and our `1e9 / timestampPeriod` answer
+(the exact 0x3b9aca00 seen in the object) overwrote that fence proxy's first qword. The later `call [vptr+0x60]` then
+jumped through 0x3b9aca60.
+
+Fix: the queue proxy maps console 16->PC Signal (fence unwrapped), 17->Wait, 18->GetTimestampFrequency,
+19->GetClockCalibration, 20->GetDesc (the struct-return conversion now lives there), and the two unidentified inserted
+methods (console 14, 15) refuse with their arguments logged instead of landing on PC Signal/Wait. The proxy mock was
+updated to the same mapping and passes.
+
+Measured after the fix: queue slot 16 logs as Signal, queue slot 18 as GetTimestampFrequency, the highest traced call
+rises from 12,085 to **12,087**, and the stop moves from game+0x4fb0aec to **game+0x4fb0b03**.
+
+### The new stop: console fence slot 12
+
+At game+0x4fb0b03 (`mov rdx, qword ptr [rdi]`) the fault address is **0x80004001 = E_NOTIMPL**, i.e. the call before it
+returned E_NOTIMPL and the caller dereferenced the result. That call is `call [rax+0x60]` on the fence proxy - console
+**fence slot 12**, which the fence proxy refuses as beyond the 12-slot PC chain. It is called as
+`(fence, 2, &callback_struct, masked)` and the caller then reads `[result]`, comparing it with -1: the shape of "give me
+the address of the value being waited on, -1 means not ready". The next step is to identify that console fence extension
+(its arity and what the pointer must point at) and implement it - the same measurement-over-guess pattern as the queue
+shift.
