@@ -22,13 +22,13 @@ clean-room approach, plus the boot fixes measured on this machine.
 | Stage | State | What backs that |
 |---|---|---|
 | Image and platform | **done** | the title's PE32+ image maps at its preferred base, imports resolve through shims, static TLS is redirected for 53,246 slot-0 reads, heap and file system come from the host |
-| Shader corpus | **done** | 26,616 SPIR-V modules indexed from 26,503 carved game modules plus the pipeline library; the pipeline library and FSPX repair are wired into make_game, so a fresh build reproduces the index |
-| Console D3D12 on Vulkan | **done** | device, queues, allocators, descriptor heaps, command lists and pipelines answer on an RTX 4090; the retail boot reaches 11,986 D3D12 calls with 0 pipeline failures and no stand-in pipelines |
+| Shader corpus | **done** | 26,616 SPIR-V modules indexed; the pipeline library and FPSX repair are part of the build, and the boot loads 27,890 translated entries with 0 pipeline failures |
+| Console D3D12 on Vulkan | **done** | device, queues, fences, allocators, descriptor heaps, command lists and pipelines answer; the console queue's two-method slot shift, the A8 render-target format and the fence completed-value address are measured and mapped |
 | Console DirectStorage | **done** | factory, file open, zlib decompression; BCPack and swizzled reads still refuse rather than guess |
-| Boot chain | in progress | the title gets well past renderer setup and into its own render code; it now stops on a container element it built empty (see the frontier), not on a shim refusal |
-| Frame loop | not reached | console frame-event calls are answered, but the title has not yet completed one frame |
-| Presentation | not reached | no presented frame yet |
-| World rendering | not reached | no world load yet |
+| Boot chain | **done** | the title boots and runs its own loop for at least 400 s with no exception (5.2M traced D3D12 calls in 300 s), after the fence slot 12 answer |
+| Frame loop | in progress | the loop iterates, but its command lists arrive already closed and it never executes or resets them |
+| Presentation | not reached | console PresentX (queue slot 32) still refuses with E_NOTIMPL, once per frame iteration |
+| World rendering | not reached | nothing is executed on the GPU yet, so nothing can be drawn |
 
 | Measured | Value |
 |---|---|
@@ -42,15 +42,17 @@ clean-room approach, plus the boot fixes measured on this machine.
 | Distinct graphics programs behind them | 1,264 (945 PS, 319 VS) |
 | Stand-in effect on the stop | none (same instruction, same null) |
 | A8 render-target formats refused | 0 (was 1 per factory call) |
-| Highest traced D3D12 call (after the queue slot shift) | 12,087 |
+| Retail boot result | ALIVE 400 s, no exception |
+| Traced D3D12 calls in 300 s | 5,195,024 |
+| Fence completed-value answers in one run | 245,524+ |
 
-**Where it stops now:** `game+0x4fb0b03` - the console queue inserts two methods before Signal, so console slots 16..20 are PC 14..18; forwarding by number had sent console Signal into PC GetTimestampFrequency, which wrote our 1e9 frequency answer over a fence proxy's first qword. That is fixed and measured (12,085 -> 12,087 traced calls, stop moved). The new stop is console fence slot 12: the caller dereferences its result and compares with -1, the shape of 'address of the value being waited on, -1 = not ready'.
+**Where it stops now:** `none - the title runs (ALIVE 400 s, no exception)` - the title now boots into its own frame loop and keeps running: the fence's completed-value address (console fence slot 12) was the last boot-chain refusal. The frontier is now presentation: PresentX (console queue slot 32) is refused once per iteration, and each iteration's two command lists come back already closed - there is no command-list Reset and no ExecuteCommandLists anywhere in the boot, so nothing is recorded, executed or presented.
 Measurements and the method behind them: [docs/boot_frontier.md](docs/boot_frontier.md).
 
 Next up:
-- identify and implement console fence slot 12 (its result is dereferenced; -1 means not ready)
-- convert slot-57 records into real pipelines for rendering (needed, measured not to be the boot blocker)
-- fix the shader stage's two-shader completeness gate and the quadratic llvm-mc listings
+- find why the frame's command lists are already closed (no Reset, no ExecuteCommandLists in the whole boot)
+- implement console PresentX (queue slot 32) - the one call the frame loop makes and we refuse
+- convert slot-57 records into real pipelines, now needed for the draws the lists never record
 
 More: [the full measurement ladder](docs/boot_frontier.md), [the null-object chain trace](docs/null_object_chain.md), [how the other public attempt is built](docs/competitor_intel.md), [incoming reports and tracked findings](docs/issues.md).
 

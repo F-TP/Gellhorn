@@ -544,3 +544,36 @@ returned E_NOTIMPL and the caller dereferenced the result. That call is `call [r
 the address of the value being waited on, -1 means not ready". The next step is to identify that console fence extension
 (its arity and what the pointer must point at) and implement it - the same measurement-over-guess pattern as the queue
 shift.
+
+
+## Frontier 2026-11-24 (the boot runs: no exception for 300 s, and the frontier is presentation)
+
+Console fence slot 12 was the last thing standing between the title and its own frame loop. Identified from the caller and
+the channel table (docs/fence_slot12.md), it is the console extension that returns **the address of the fence's completed
+value**: the title polls that 64-bit word in a `monitorx`/`mwaitx` loop and compares it with the value it signalled,
+treating `UINT64_MAX` as the removed-device word. The fence proxy now keeps a 64-bit cell that is refreshed from the real
+fence whenever a proxy call moves the value, published when the console queue's `Signal` or the fence's own calls move it,
+and armed through the Vulkan layer's fence dispatcher for values reached later (held or GPU signals). Monotonic, honest
+logs, and the mock test covers it.
+
+Measured, twice (the owner's 400 s run and an independent 300 s run with the same environment):
+
+| | before slot 12 | after |
+|---|---|---|
+| result | crash at game+0x4fb0b03 (read of 0x80004001) | **no exception at all** |
+| verdict | STOP | **ALIVE 300 s / ALIVE 400 s, killed by the timeout** |
+| highest traced call | 12,087 | **5,195,024 in 300 s** (6,887,539 in 400 s) |
+| fence slot 12 answers | refused | 245,524+ |
+
+So the title now boots into its own loop and keeps running. What it does there is the next problem, and the trace names it:
+
+* **`PresentX` (console queue slot 32) is still refused** with E_NOTIMPL, once per frame iteration.
+* The frame's two command lists come back **already closed**: about 625 `Close` calls succeed during startup, then every
+  frame iteration's two `Close` calls fail (491,037 of them in one run), and the boot contains **no command-list `Reset`
+  and no `ExecuteCommandLists` at all**. The lists are therefore never re-recorded and nothing is executed or presented.
+* The rest of the frame iteration is two `Signal`s, a `GetTimestampFrequency`, an allocator `Reset` - a submit shape whose
+  lists are missing.
+
+The frontier is consequently presentation and command-list lifecycle, not the boot chain: why the title's lists are still
+closed at the top of a frame (its `Reset`/`ExecuteCommandLists` calls either never happen or are not the console methods we
+map), and what the console's `PresentX` needs.
