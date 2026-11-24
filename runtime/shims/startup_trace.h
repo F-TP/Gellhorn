@@ -198,8 +198,33 @@ inline void log_exception(const EXCEPTION_POINTERS& info) {
                          ",\"rsp\":" + quote(hex(c.Rsp)) + ",\"rbp\":" + quote(hex(c.Rbp)) +
                          ",\"rbx\":" + quote(hex(c.Rbx)) + ",\"r12\":" + quote(hex(c.R12)) +
                          ",\"r13\":" + quote(hex(c.R13)) + ",\"r14\":" + quote(hex(c.R14)) +
-                         ",\"r15\":" + quote(hex(c.R15));
+                         ",\"r15\":" + quote(hex(c.R15)) +
+                         ",\"rax\":" + quote(hex(c.Rax)) + ",\"r10\":" + quote(hex(c.R10)) +
+                         ",\"r11\":" + quote(hex(c.R11));
                     f += "}";
+                    // The first eight TlsAlloc cells of this thread and the first qword each points at: a mapped image's
+                    // index-0 TLS reads go through one of them (the loader's view), so a wrong view or view[0] shows up
+                    // here next to the faulting registers.
+                    if (std::getenv("LEONIDA_TRACE_TLS")) {
+                        f += ",\"tls\":[";
+                        for (int cell = 0; cell < 8; ++cell) {
+                            const auto address = static_cast<std::uintptr_t>(__readgsqword(0x1480 + 8 * cell));
+                            std::uint64_t first = 0;
+                            bool readable = false;
+                            if (address) {
+                                MEMORY_BASIC_INFORMATION mbi{};
+                                readable = VirtualQuery(reinterpret_cast<const void*>(address), &mbi, sizeof(mbi)) ==
+                                               sizeof(mbi) &&
+                                           mbi.State == MEM_COMMIT &&
+                                           !(mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD));
+                                if (readable) first = *reinterpret_cast<const std::uint64_t*>(address);
+                            }
+                            if (cell) f += ",";
+                            f += "{\"cell\":" + std::to_string(cell) + ",\"ptr\":" + quote(hex(address)) +
+                                 ",\"first\":" + quote(hex(first)) + "}";
+                        }
+                        f += "]";
+                    }
                 }
             }
             event("exception", f);

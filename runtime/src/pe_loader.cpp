@@ -483,6 +483,12 @@ void install_thread_block(Module& m) {
 
     void* saved = slots[m.tls_index];
     slots[m.tls_index] = block;
+    if (std::getenv("LEONIDA_TRACE_TLS")) {
+        std::fprintf(stderr,
+                     "[rt] tls: installed %s in thread %lu: block %p, module index %u, ga slot %u, view %p\n",
+                     m.name.c_str(), static_cast<unsigned long>(GetCurrentThreadId()), block, m.tls_index,
+                     m.tls_ga_slot, static_cast<void*>(view));
+    }
     entry.module = &m;
     entry.generation = m.tls_generation;
     entry.saved = saved;
