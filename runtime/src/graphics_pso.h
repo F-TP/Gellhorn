@@ -1,0 +1,148 @@
+// The backend that turns a console slot-57 graphics pipeline record (runtime/src/graphics_record.h) into what the PC
+// layer builds a real graphics pipeline from:
+//
+//   - resolve_native_stage(): the native branch of PipelineState::create_graphics (runtime/shims/d3d12_vulkan_device.cpp).
+//     The title's precompiled pipeline-library graphics programs are native RDNA2 programs, not FSSM/DXBC
+//     (docs/fspx.md, docs/pipeline_program_source.md), and their identity is the SHA-256 of the program bytes as
+//     passed - the shader index's fspx_code_sha256, the same key create_compute already resolves compute programs
+//     with. This resolves one graphics stage the way create_compute resolves a compute shader, under the stage's own
+//     name ("ps", "vs", "ms", "gs"), and refuses a program whose translations differ when no kind-0 state can pick
+//     between them instead of choosing one.
+//   - build(): a decoded record plus the caller's inputs -> D3D12_GRAPHICS_PIPELINE_STATE_DESC.
+//
+// Neither function creates a device object, needs a GPU or reads a game file: the tests build every byte and the
+// shader index themselves (runtime/test/graphics_pso_test.cpp).
+//
+// What the console record does not yield is an explicit input, never a default: the root signature (the decoder copies
+// only the pointer value) and the whole fixed-function state, because no word of the 380..520-byte state blob is decoded
+// (docs/graphics_record.md section 4). GraphicsPsoInputs::defaults is that state, every field the caller's, and
+// documented_default_state() is the one set the project documents as the measurement stand-in for the undecoded blob.
+// What the record cannot prove is a refusal with the field named in `why`, never a guess: today that is every record
+// whose decoded input layout has an element, because the console format code is not mapped to a DXGI format and the
+// 28 attribute bytes' field encoding (slot, offset, class, index) is undecoded too (section 5).
+//
+// docs/graphics_pso.md has the input contract, the refusal table, the documented default set and the wiring.
+#pragma once
+
+#include <windows.h>
+#include <d3d12.h>
+
+#include <cstddef>
+#include <cstdint>
+#include <functional>
+#include <span>
+#include <string>
+#include <vector>
+
+#include "graphics_record.h"
+#include "shader_library.h"
+
+namespace rt::graphics_pso {
+
+// Among the index entries for one program (containers or translations of the same key), the one to build: the first
+// that `fits` and declares no set-0 bindings (the cheaper pipeline); else the first that fits; else the first without
+// bindings; else the first. Null when there is none. Shared by create_graphics and create_compute, so a translated
+// FSSM program and a native graphics program are chosen by the same rule.
+template<typename Fits>
+const leonida::ShaderEntry* pick_entry(const std::vector<const leonida::ShaderEntry*>& candidates, Fits&& fits) {
+    const leonida::ShaderEntry* fitting = nullptr;
+    const leonida::ShaderEntry* unbound = nullptr;
+    for (const leonida::ShaderEntry* e : candidates) {
+        const bool fit = fits(*e);
+        if (fit && !e->binding_count) return e;
+        if (fit && !fitting) fitting = e;
+        if (!e->binding_count && !unbound) unbound = e;
+    }
+    if (fitting) return fitting;
+    if (unbound) return unbound;
+    return candidates.empty() ? nullptr : candidates.front();
+}
+
+// One graphics stage's native program, as the shader library resolves it.
+struct NativeStage {
+    // The program the bytecode named: its kind-6 bytes - which the pipeline copies to the GPU address arena as the
+    // stage's code base, exactly as create_compute does - and its kind-0 dispatch state, when the bytecode carried one
+    // (an FSPX payload or a DXBC container with an ACCC part). Empty when nothing was classified.
+    leonida::ComputeProgram program;
+    // The library entry to build the stage from, or null when the program did not resolve (then `why` says why).
+    const leonida::ShaderEntry* entry = nullptr;
+    // True when the bytes were not a program compute_program() recognises (no FSPX prologue) and were looked up by
+    // the SHA-256 of their own bytes instead: the publication's key for the library's graphics programs
+    // (docs/pipeline_program_source.md). Recorded so the caller's log says which identity matched.
+    bool raw_key = false;
+};
+
+// The native branch of PipelineState::create_graphics for one graphics stage whose D3D12_SHADER_BYTECODE holds no
+// FSSM blob. `stage` is the record slot's stage name ("ps", "vs", "ms", "gs"); the stage blob carries no identity, the
+// slot does (docs/shader_library.md section 2). `fits` is create_graphics' per-entry test: a vertex shader's inputs
+// must be fed by the PSO's input layout, the other stages pass true.
+//
+// Returns false when the bytes are not a native graphics program this tree can name (no FSSM blob, no usable FSPX
+// program, and no shader-index entry under the SHA-256 of the bytes): the caller's FSSM/DXBC and stand-in paths, and
+// their refusal, apply. Returns true when they are one; then NativeStage::entry is the entry to build, or null with
+// `why` naming the refusal. `why` is cleared on entry and set only on a refusal; both may be null when unneeded.
+bool resolve_native_stage(std::span<const std::uint8_t> bytecode, const char* stage,
+                          const leonida::ShaderLibrary& library,
+                          const std::function<bool(const leonida::ShaderEntry&)>& fits, NativeStage* out,
+                          std::string* why);
+
+// The fixed-function state a PC graphics pipeline needs and the console record's 380..520-byte state blob has not
+// yielded: rasterizer, blend, depth-stencil, topology type, index-buffer strip cut and the sample description
+// (docs/graphics_record.md section 4). Every field is the caller's: this struct has no defaults of its own and build()
+// has no fallback, so a state substituted for the undecoded blob is always an explicit input. Fill every field - a
+// zeroed one is refused with its field named, not treated as "the console's".
+struct FixedFunctionState {
+    D3D12_RASTERIZER_DESC rasterizer;
+    D3D12_BLEND_DESC blend;
+    D3D12_DEPTH_STENCIL_DESC depth_stencil;
+    D3D12_PRIMITIVE_TOPOLOGY_TYPE topology_type;
+    D3D12_INDEX_BUFFER_STRIP_CUT_VALUE strip_cut;
+    UINT sample_count;
+    UINT sample_quality;
+    UINT sample_mask;
+};
+
+// The project's documented default set for FixedFunctionState (docs/graphics_pso.md), for a caller that has only the
+// undecoded blob: triangle list, solid fill, back-face culling, depth clipping on, blending off, depth and stencil
+// off, sample count 1 with the full mask. It is a measurement stand-in, not the console's state: passing it is a
+// decision the caller makes and logs (the create_standin_graphics_pipeline defaults are the same set).
+FixedFunctionState documented_default_state();
+
+// One stage's bytecode, indexed by record slot (rt::graphics_record::kStageSlotPs, kStageSlotVs, kStageSlotMs): the
+// bytes create_graphics will classify and resolve. For a slot-57 record this is the stage's native program as passed
+// (record.stages[i].program), or an FSPX payload carrying its kind-0 state when the caller has one. A slot the record
+// uses needs bytes here; a slot it does not use must have none.
+struct StageBytecode {
+    const void* data;
+    SIZE_T size;
+};
+
+// What the caller knows and the record does not carry. Every member is required; build() refuses a missing one by
+// name rather than inventing a value.
+struct GraphicsPsoInputs {
+    // The PC root signature for the record's +0x00 root signature (record.root_signature). The decoder copies only the
+    // console pointer, so the caller validates/maps it and passes the PC object; null is refused as pRootSignature.
+    ID3D12RootSignature* root_signature;
+    // The render targets the PSO is created against, as the caller knows them from the bound views. Slots at and above
+    // render_target_count must be DXGI_FORMAT_UNKNOWN, as D3D12 requires, and a used slot needs a format.
+    DXGI_FORMAT rtv_formats[D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT];
+    UINT render_target_count;
+    DXGI_FORMAT dsv_format;  // DXGI_FORMAT_UNKNOWN: no depth-stencil attachment
+    // The state the record does not yield. build() writes exactly these values into the description.
+    FixedFunctionState defaults;
+    // The resolved native program bytes per record slot (see StageBytecode). The caller resolves them before calling
+    // (by SHA-256, which is what resolve_native_stage does); build() cannot look a program up and does not pretend to.
+    StageBytecode stages[rt::graphics_record::kStageSlotCount];
+};
+
+// The PC graphics-pipeline description for a decoded record, or false with `why` naming the field that stops it.
+// `out` is untouched on false. On success every D3D12_GRAPHICS_PIPELINE_STATE_DESC field is filled: the stages from
+// `inputs.stages`, the input layout as the decoder proved it (an empty one: any element is refused, see the header
+// comment), the fixed-function state from `inputs.defaults`, the attachments from the caller, and NodeMask 0, flags
+// NONE, no cached PSO and no stream output (the console record carries none of those). A mesh stage is refused: a
+// D3D12_GRAPHICS_PIPELINE_STATE_DESC has no mesh-shader field, so a record with slot 2 needs the pipeline-state-stream
+// path instead (docs/graphics_pso.md).
+bool build(const rt::graphics_record::Record& record, const GraphicsPsoInputs& inputs,
+           D3D12_GRAPHICS_PIPELINE_STATE_DESC* out, std::string* why);
+
+}  // namespace rt::graphics_pso

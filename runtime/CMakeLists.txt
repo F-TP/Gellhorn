@@ -495,6 +495,18 @@ if(BUILD_TESTING)
     target_compile_options(graphics_record_test PRIVATE /W4 /permissive- /utf-8)
   endif()
   add_test(NAME graphics_record COMMAND graphics_record_test)
+  # The slot-57 backend: the native (FSPX) graphics-stage resolution and the record -> D3D12_GRAPHICS_PIPELINE_STATE_DESC
+  # builder (src/graphics_pso.h, docs/graphics_pso.md). Synthetic records and a synthetic shader index, no device and no
+  # game files. It needs d3d12.h for the D3D12_GRAPHICS_PIPELINE_STATE_DESC it builds, which is why it is Windows-only.
+  if(WIN32)
+    add_executable(graphics_pso_test test/graphics_pso_test.cpp src/graphics_pso.cpp src/graphics_record.cpp)
+    target_include_directories(graphics_pso_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_compile_definitions(graphics_pso_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    if(MSVC)
+      target_compile_options(graphics_pso_test PRIVATE /W4 /permissive- /utf-8)
+    endif()
+    add_test(NAME graphics_pso COMMAND graphics_pso_test)
+  endif()
   # VulkanContext::buffer_at's VA index (runtime/src/buffer_va_index.h): pure stdlib, no Vulkan instance.
   add_executable(buffer_va_index_test test/buffer_va_index_test.cpp)
   add_test(NAME buffer_va_index COMMAND buffer_va_index_test)
@@ -1657,7 +1669,7 @@ if(TARGET Vulkan::Headers)
       COMMENT "Generating D3D12 COM stubs"
       VERBATIM)
     add_library(gta6rt_d3d12_com STATIC shims/d3d12_com.cpp shims/d3d12_vulkan_device.cpp shims/d3d12_xs_device.cpp shims/xbox_present.cpp
-                shims/dxgi_com.cpp ${LEONIDA_STUBS})   # d3d12_vulkan_device.cpp reads the PC device behind the proxy (#224)
+                shims/dxgi_com.cpp src/graphics_record.cpp src/graphics_pso.cpp ${LEONIDA_STUBS})   # d3d12_vulkan_device.cpp reads the PC device behind the proxy (#224) and its native graphics-stage branch resolves the slot-57 record through src/graphics_pso.cpp
     target_include_directories(gta6rt_d3d12_com PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)
     target_link_libraries(gta6rt_d3d12_com PUBLIC Vulkan::Headers gta6rt_root_signature)
     target_compile_definitions(gta6rt_d3d12_com PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)

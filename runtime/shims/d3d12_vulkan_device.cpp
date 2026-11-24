@@ -27,6 +27,7 @@
 #include "../src/conservative_raster.h"
 #include "../src/resource_detile.h"
 #include "../src/shader_library.h"
+#include "../src/graphics_pso.h"
 #include "../src/spirv_f16_halves.h"
 #include "../src/spirv_stores.h"
 #include "../src/vulkan_present.h"
@@ -3094,21 +3095,9 @@ void register_literal_samplers(DeviceState& device, const leonida::ShaderEntry& 
 
 // Among index entries for one program (containers with the same FSSM program; 789 groups in the 26,503-shader
 // corpus), the one to build: the first that `fits` and declares no set-0 bindings (the cheaper pipeline); else the
-// first that fits; else the first without bindings; else the first. Null when there is none.
-template<typename Fits>
-const leonida::ShaderEntry* pick_entry(const std::vector<const leonida::ShaderEntry*>& candidates, Fits&& fits) {
-    const leonida::ShaderEntry* fitting = nullptr;
-    const leonida::ShaderEntry* unbound = nullptr;
-    for (const leonida::ShaderEntry* e : candidates) {
-        const bool fit = fits(*e);
-        if (fit && !e->binding_count) return e;
-        if (fit && !fitting) fitting = e;
-        if (!e->binding_count && !unbound) unbound = e;
-    }
-    if (fitting) return fitting;
-    if (unbound) return unbound;
-    return candidates.empty() ? nullptr : candidates.front();
-}
+// first that fits; else the first without bindings; else the first. Null when there is none. It lives in
+// src/graphics_pso.h so the native graphics-stage branch below and the compute path choose by the same rule.
+using rt::graphics_pso::pick_entry;
 
 // Whether the input layout has an element for every ordinary (non-system-value) input of the vertex shader.
 bool layout_feeds(const leonida::ShaderEntry& vs, const D3D12_INPUT_LAYOUT_DESC& layout) {
@@ -3713,35 +3702,64 @@ public:
                                                 desc.RasterizerState.DepthBiasClamp};
         for (Stage& stage : stages) {
             if (!stage.code.pShaderBytecode || !stage.code.BytecodeLength) continue;  // no PS: depth only
-            stage.fssm = leonida::fssm_program(
-                {static_cast<const std::uint8_t*>(stage.code.pShaderBytecode), stage.code.BytecodeLength});
+            const std::span<const std::uint8_t> bytecode{
+                static_cast<const std::uint8_t*>(stage.code.pShaderBytecode), stage.code.BytecodeLength};
+            stage.fssm = leonida::fssm_program(bytecode);
             if (stage.fssm.empty()) {
                 // The graphics stand-in's own module (see create_standin_graphics_pipeline): no library record and no
                 // library lookup at all. `continue` skips the per-entry handling below (bindings, mesh limits, code
                 // base, f16 halves, writable storage) - none of it applies to the default entry.
-                if (!standin) {
-                    log_once("shader bytecode holds no FSSM program; bytes", int(stage.code.BytecodeLength));
+                if (standin) {
+                    const std::vector<std::uint32_t>& words = standin_stage_words(stage.name);
+                    if (words.empty()) {
+                        log_once("the graphics stand-in has a VS+PS pair only; stage", int(stage.bit));
+                        return E_NOTIMPL;
+                    }
+                    stage.words = words;
+                    stage.entry = &standin_entry();
+                    continue;
+                }
+                // The title's precompiled pipeline-library graphics programs are native RDNA2 programs, not FSSM/DXBC:
+                // this is the graphics analogue of create_compute's lookup, under the stage's own name, and an
+                // ambiguous program (translations that differ, no kind-0 state to choose between them) is refused
+                // (src/graphics_pso.h). `stage.fssm` is the field the code base below is uploaded from, and for a
+                // native stage the bytes the pipeline copies are the kind-6 program - exactly what create_compute
+                // copies for its program.
+                const bool vertex = stage.bit == VK_SHADER_STAGE_VERTEX_BIT;
+                rt::graphics_pso::NativeStage native;
+                std::string refusal;
+                if (!rt::graphics_pso::resolve_native_stage(
+                        bytecode, stage.name, *library,
+                        [&](const leonida::ShaderEntry& e) { return !vertex || layout_feeds(e, desc.InputLayout); },
+                        &native, &refusal)) {
+                    log_once("shader bytecode holds no FSSM or native FSPX kind-6 program; bytes",
+                             int(stage.code.BytecodeLength));
                     return E_INVALIDARG;
                 }
-                const std::vector<std::uint32_t>& words = standin_stage_words(stage.name);
-                if (words.empty()) {
-                    log_once("the graphics stand-in has a VS+PS pair only; stage", int(stage.bit));
-                    return E_NOTIMPL;
+                if (!native.entry) {
+                    std::fprintf(stderr, "[rt] d3d12: %s\n", refusal.c_str());
+                    return E_INVALIDARG;
                 }
-                stage.words = words;
-                stage.entry = &standin_entry();
-                continue;
-            }
-            const std::string hash = leonida::sha256_hex(stage.fssm);
-            // Containers with the same program can differ in their input signature or bindings: a VS must have its
-            // inputs fed by this input layout (else the layout check below reports it).
-            const bool vertex = stage.bit == VK_SHADER_STAGE_VERTEX_BIT;
-            stage.entry = pick_entry(library->candidates(stage.name, hash), [&](const leonida::ShaderEntry& e) {
-                return !vertex || layout_feeds(e, desc.InputLayout);
-            });
-            if (!stage.entry) {
-                std::fprintf(stderr, "[rt] d3d12: no translated %s for FSSM sha256 %s\n", stage.name, hash.c_str());
-                return E_INVALIDARG;
+                if (native.raw_key)
+                    std::fprintf(stderr,
+                                 "[rt] d3d12: %s program has no FSPX prologue; it was found by the SHA-256 of its "
+                                 "program bytes (fspx_code_sha256): %s\n",
+                                 stage.name, leonida::sha256_hex(native.program.bytes).c_str());
+                stage.entry = native.entry;
+                stage.fssm = std::move(native.program.bytes);
+            } else {
+                const std::string hash = leonida::sha256_hex(stage.fssm);
+                // Containers with the same program can differ in their input signature or bindings: a VS must have
+                // its inputs fed by this input layout (else the layout check below reports it).
+                const bool vertex = stage.bit == VK_SHADER_STAGE_VERTEX_BIT;
+                stage.entry = pick_entry(library->candidates(stage.name, hash), [&](const leonida::ShaderEntry& e) {
+                    return !vertex || layout_feeds(e, desc.InputLayout);
+                });
+                if (!stage.entry) {
+                    std::fprintf(stderr, "[rt] d3d12: no translated %s for FSSM sha256 %s\n", stage.name,
+                                 hash.c_str());
+                    return E_INVALIDARG;
+                }
             }
             if (stage.entry->binding_count) {
                 if (!device_.bindless) {
