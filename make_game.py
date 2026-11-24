@@ -22,7 +22,9 @@ Stages (each skips work that is already done, so a stopped build continues where
     check     always first: file names and sizes against game/<version>.json (add --full-check for SHA-256, slow)
     shaders   carve shaders.rpf, unpack the native RDNA2 code, disassemble, translate to SPIR-V; then the same for the
               compute programs inside amd_fidelityfx_upscaler_xbox.dll (after repairing the listings the console's
-              wider register file makes LLVM skip), the pipeline library inside shaders.rpf, and XboxBvhBuilder.dll
+              wider register file makes LLVM skip), the pipeline library inside shaders.rpf, and XboxBvhBuilder.dll.
+              A pipeline library graphics selection is translated too when LEONIDA_GRAPHICS_PROGRAMS names a list of
+              wanted program SHA-256 hashes (else nothing extra happens)
     assets    models (OBJ), texture dictionaries and texture pools (DDS), audio banks (AWC; --wav adds PCM WAV)
               BCPack uses strict decoding by default. For local calibration use <work>/bcpack-calibration.json.
     runtime   build the loader (needs the game's executable to run, not to build). On Linux it is cross-built with
@@ -1320,6 +1322,7 @@ def shaders(game: str, work: str, jobs: int, emulate: bool = False, keep_emulate
     fspx_shaders(game, work, signature, emulate=emulate, fallbacks=fallbacks)
     bvh_shaders(game, work, signature, jobs, emulate=emulate, fallbacks=fallbacks)
     library_shaders(game, work, signature, jobs, emulate=emulate, fallbacks=fallbacks)
+    graphics_shaders(game, work, signature, jobs, emulate=emulate, fallbacks=fallbacks)
     log("shaders: done")
 
 
@@ -1633,6 +1636,11 @@ def bvh_shaders(game: str, work: str, mc_signature: str, jobs: int = 1, emulate:
 
 LIBRARY_RPF = "shaders.rpf"
 LIBRARY_STAGES = "cs"     # the compute programs are the ones the title deserializes (docs/shader_library.md)
+# The published entry-name prefixes the compute library step owns in the FSPX index. It must not be wider than that:
+# merge_library_corpus() drops an entry of an owned prefix the staged index no longer names, and a later run of this
+# step must not delete the graphics selection's lib_ps_*/lib_vs_* entries (graphics_shaders publishes those with
+# GRAPHICS_OWNED, which leaves lib_cs_* alone the same way).
+LIBRARY_OWNED = tuple(f"lib_{stage}_" for stage in LIBRARY_STAGES.split(","))
 LIBRARY_EXTRACTED_RECORD = "extraction.json"    # written after the extraction: a stop partway leaves no marker
 LIBRARY_BUILD_RECORD = "pipeline_library_build.json"   # written after the published translation, as fspx_build.json
 # The extraction's inputs, as FSPX_TOOLS holds its step's: the extracting tools, and the carve that supplies the
@@ -1737,7 +1745,7 @@ def library_report(extracted: int, translated: int) -> None:
     log(f"shaders: {translated} of {extracted} pipeline library compute programs translated")
 
 
-def merge_library_corpus(staged: str, fspx: str) -> None:
+def merge_library_corpus(staged: str, fspx: str, owned: "tuple[str, ...]" = ("lib_",)) -> None:
     """Publish the staged pipeline-library entries and modules where the runtime looks them up.
 
     runtime/src/shader_library.h's load() reads <work>/shaders/spirv/index.json and the indexes of its fspx/ and bvh/
@@ -1745,7 +1753,10 @@ def merge_library_corpus(staged: str, fspx: str) -> None:
     state, so the library finds it exactly like an FSPX program: by fspx_code_sha256 and fspx_state_sha256, from the
     fspx index, with the module at fspx/<name>.spv. A folder of the translation's own would not be loaded, so the
     entries go beside the FSPX ones and their modules are hard-linked (or copied) there. The fspx step rebuilds its
-    index whenever it translates again; library_shaders() publishes these entries again on that run."""
+    index whenever it translates again; library_shaders() publishes these entries again on that run.
+
+    `owned` are the entry-name prefixes this step publishes: an entry with one of them that the staged index no
+    longer names is dropped from the published index, and entries of another step (another prefix) are left alone."""
     index = library_translated(staged)
     if not index:
         fail(f"shaders: the pipeline library translation in {staged} is incomplete (no index.json, or a module is "
@@ -1771,7 +1782,7 @@ def merge_library_corpus(staged: str, fspx: str) -> None:
              "pipeline library entries cannot be added without dropping what is in it. Run the shaders stage again")
     if not isinstance(combined, dict):
         fail(f"shaders: {path} is not a JSON object, so the pipeline library entries cannot be added to it")
-    for gone in [name for name in combined if name.startswith("lib_") and name not in index]:
+    for gone in [name for name in combined if name.startswith(owned) and name not in index]:
         del combined[gone]
         drop(os.path.join(fspx, gone + ".spv"))
     for name in index:
@@ -1816,7 +1827,7 @@ def library_shaders(game: str, work: str, mc_signature: str, jobs: int = 1, emul
     if index and names:
         if not library_merged(staged, fspx, index):
             log("shaders: the pipeline library programs are translated; publishing them into the shader corpus again")
-            merge_library_corpus(staged, fspx)
+            merge_library_corpus(staged, fspx, owned=LIBRARY_OWNED)
         library_report(len(names), len(index))
         return
     log("shaders: extracting and translating the pipeline library's compute programs")
@@ -1846,9 +1857,226 @@ def library_shaders(game: str, work: str, mc_signature: str, jobs: int = 1, emul
         fail(f"shaders: rdna2spirv.py wrote no complete pipeline library translation in {staged}. Run the shaders "
              "stage again; the translator's output above names each program it refused")
     library_report(len(names), len(index))
-    merge_library_corpus(staged, fspx)
+    merge_library_corpus(staged, fspx, owned=LIBRARY_OWNED)
     with open(settings_file, "w", encoding="utf-8", newline="\n") as f:
         f.write(settings + "\n")
+
+
+GRAPHICS_PROGRAMS_ENV = "LEONIDA_GRAPHICS_PROGRAMS"
+# The wanted graphics program list is data, not repository content: a file named by LEONIDA_GRAPHICS_PROGRAMS, or
+# <work>/graphics_programs.json when that is not set. A build without one does not run the step at all.
+GRAPHICS_PROGRAMS_FILE = "graphics_programs.json"
+GRAPHICS_STAGES = "ps,vs"
+GRAPHICS_EXTRACTED_RECORD = "extraction.json"            # written after the extraction, as LIBRARY_EXTRACTED_RECORD
+GRAPHICS_BUILD_RECORD = "pipeline_graphics_build.json"   # written after the published translation
+# The published entry-name prefixes this step owns in the FSPX index. Another step's prefixes are left alone.
+GRAPHICS_OWNED = ("lib_ps_", "lib_vs_")
+
+
+def graphics_programs_path(work: str) -> str:
+    """Where the wanted graphics program list is read from: LEONIDA_GRAPHICS_PROGRAMS, else <work>/graphics_programs.json."""
+    named = os.environ.get(GRAPHICS_PROGRAMS_ENV, "").strip()
+    return os.path.abspath(named) if named else os.path.join(work, GRAPHICS_PROGRAMS_FILE)
+
+
+def graphics_extraction_settings(package: str, mc_signature: str, wanted: str) -> str:
+    """What <work>/shaders/pipeline_graphics depends on: the package, the extracting tools, llvm-mc and the exact
+    wanted list the selection read (a changed list extracts its programs again)."""
+    return json.dumps({"package": package, "tools": sources_digest(TOOLS, LIBRARY_TOOLS), "llvm_mc": mc_signature,
+                       "stages": GRAPHICS_STAGES, "wanted": file_sha256(wanted)}, sort_keys=True)
+
+
+def graphics_settings(package: str, mc_signature: str, emulate: bool, fallbacks: "tuple[str, ...]",
+                      wanted: str) -> str:
+    """What the wanted graphics programs' modules depend on, as library_settings, plus the wanted list."""
+    return json.dumps({"package": package, "tools": sources_digest(TOOLS, LIBRARY_TOOLS),
+                       "translator": translation_sources_digest(), "llvm_mc": mc_signature,
+                       "wave64_emulate": bool(emulate), "fallbacks": list(fallbacks), "stages": GRAPHICS_STAGES,
+                       "wanted": file_sha256(wanted)}, sort_keys=True)
+
+
+def graphics_extraction_complete(extracted: str) -> "list[str] | None":
+    """The programs when the extraction wrote everything the translator reads, else None.
+
+    tools/shader_library.py writes the index last, but a stop after it would still leave the sidecars of the programs
+    it never reached; the marker is written only after every program's files have been checked. The wanted report is
+    checked too: it is where the step's found/missing counts come from."""
+    names = library_extraction_programs(extracted)
+    if not names or not os.path.isfile(os.path.join(extracted, "wanted.json")):
+        return None
+    for name in names:
+        if not all(os.path.isfile(path) for path in (
+                os.path.join(extracted, "fspx", name + ".code"),
+                os.path.join(extracted, "fspx", name + ".json"),
+                os.path.join(extracted, "disasm", name + ".s"))):
+            return None
+    return names
+
+
+def graphics_extraction_ok(extracted: str, settings: str) -> "list[str] | None":
+    """The programs when the extraction still matches its inputs (the marker) and is complete, else None."""
+    if read_shader_setting(os.path.join(extracted, GRAPHICS_EXTRACTED_RECORD)) != settings:
+        return None
+    return graphics_extraction_complete(extracted)
+
+
+def graphics_translated(staged: str) -> "dict | None":
+    """The translated entries, with every module beside them, or None. Empty when the translator refused every
+    program: unlike the compute library and the FSPX set, a partial graphics selection is published on purpose, so an
+    empty one has to be told apart from an unreadable index."""
+    try:
+        with open(os.path.join(staged, "index.json"), encoding="utf-8") as f:
+            index = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(index, dict) or not all(os.path.isfile(os.path.join(staged, name + ".spv")) for name in index):
+        return None
+    return index
+
+
+def graphics_record(staged: str) -> "dict | None":
+    """The reuse record of a finished graphics translation: the settings and the listings the translator refused."""
+    try:
+        with open(os.path.join(staged, GRAPHICS_BUILD_RECORD), encoding="utf-8") as f:
+            record = json.load(f)
+    except (OSError, ValueError):
+        return None
+    return record if isinstance(record, dict) else None
+
+
+def graphics_translation_reusable(staged: str, settings: str, names: "list[str] | None") -> "dict | None":
+    """The translated entries when the step can be reused: the record matches, the index holds exactly the extracted
+    programs the translator did not refuse then, and every module is beside it. A refusal is recorded in the marker,
+    so a rerun does not translate the whole selection again for the same refusal."""
+    record = graphics_record(staged)
+    if not names or not record or record.get("settings") != settings or not isinstance(record.get("refused"), list):
+        return None
+    index = graphics_translated(staged)
+    if index is None or set(index) != set(names) - set(record["refused"]):
+        return None
+    return index
+
+
+def graphics_wanted_counts(extracted: str) -> "tuple[int, int, int, int]":
+    """(wanted, found, missing from the library, another stage) from the extraction's wanted.json, zeros if unreadable."""
+    try:
+        with open(os.path.join(extracted, "wanted.json"), encoding="utf-8") as f:
+            report = json.load(f)
+        return (sum(v for v in report["wanted"].values() if isinstance(v, int)),
+                sum(v for v in report["found"].values() if isinstance(v, int)),
+                sum(len(v) for v in report["missing"].values() if isinstance(v, list)),
+                sum(len(v) for v in report["other_stage"].values() if isinstance(v, list)))
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return 0, 0, 0, 0
+
+
+def graphics_report(extracted: str, names: list, index: dict, refused: list) -> None:
+    """One line for the wanted list and one for the translation, printed on every run also when reused: a hash the
+    library does not hold, and a program the translator refuses, are never dropped quietly."""
+    total, found, gone, elsewhere = graphics_wanted_counts(extracted)
+    log(f"shaders: {found} of {total} wanted pipeline graphics programs found in the library, {len(names)} extracted")
+    if gone or elsewhere:
+        log(f"shaders: {gone} wanted hashes name no library program's bytes and {elsewhere} name a program of another "
+            "stage, so they cannot be published")
+    log(f"shaders: {len(index)} of {len(names)} pipeline graphics programs translated and published "
+        f"({GRAPHICS_STAGES.replace(',', '/')})")
+    if refused:
+        shown = ", ".join(refused[:8]) + (f" ... ({len(refused)} in all)" if len(refused) > 8 else "")
+        log(f"shaders: NOT translated: {shown}. The translator named the instruction each one stops at above")
+
+
+def graphics_shaders(game: str, work: str, mc_signature: str, jobs: int = 1, emulate: bool = False,
+                     fallbacks: "tuple[str, ...]" = ()) -> None:
+    """The pipeline library's graphics programs the title asks for (docs/pipeline_program_source.md).
+
+    A retail boot at the slot-57 stop deserializes 9,943 graphics pipeline records that reference 1,266 distinct
+    native programs (947 PS, 319 VS). Each is identified by the SHA-256 of its bytes as passed, the same
+    fspx_code_sha256 key the index carries and create_compute resolves compute programs with. The list of those 1,266
+    hashes is data and stays outside the repository (LEONIDA_GRAPHICS_PROGRAMS, else <work>/graphics_programs.json).
+    Without it this step does nothing, so a fresh build behaves exactly as before.
+
+    tools/shader_library.py selects the library programs whose bytes have those hashes, writes their fspx/ sidecars,
+    the source containers and disasm/ listings into <work>/shaders/pipeline_graphics, rdna2spirv.py translates them
+    into <work>/shaders/spirv/pipeline_graphics, and the entries are published beside the compute library's in the
+    FSPX index (merge_library_corpus). Unlike the compute library step this one publishes what translated: a graphics
+    program the translator refuses leaves a hole the boot can report, not a failed stage.
+
+    The extraction is kept when the package, the tools, llvm-mc and the wanted list match; the translation is kept
+    when its record matches and every module of the programs it did not refuse is there."""
+    wanted = graphics_programs_path(work)
+    if not os.path.isfile(wanted):
+        log(f"shaders: no pipeline graphics program list at {wanted} (set {GRAPHICS_PROGRAMS_ENV} to a JSON list of "
+            "ps/vs SHA-256 hashes), so the step does nothing")
+        return
+    rpf = os.path.join(game, LIBRARY_RPF)
+    if not os.path.isfile(rpf):
+        log(f"shaders: no {LIBRARY_RPF} in the game folder, so no pipeline graphics programs to translate")
+        return
+    # This step publishes only its own <work>/shaders/pipeline_graphics and <work>/shaders/spirv/pipeline_graphics
+    # folders and an additive merge into <work>/shaders/spirv/fspx. It never opens, moves, replaces or deletes
+    # <work>/shaders/spirv/index.json, the translator's corpus index the runtime loads as the main library. If that
+    # index is missing the corpus translation was interrupted before its merge; failing here keeps a graphics
+    # selection from standing in for it.
+    main_index = os.path.join(work, "shaders", "spirv", "index.json")
+    if not os.path.isfile(main_index):
+        fail(f"shaders: {main_index} is missing (the main shader corpus was not merged), so the pipeline graphics "
+             "programs are not published over an incomplete corpus. Run the shaders stage again to finish the "
+             "corpus translation first.")
+    package = file_sha256(rpf)
+    extraction_settings = graphics_extraction_settings(package, mc_signature, wanted)
+    settings = graphics_settings(package, mc_signature, emulate, fallbacks, wanted)
+    extracted = os.path.join(work, "shaders", "pipeline_graphics")
+    staged = os.path.join(work, "shaders", "spirv", "pipeline_graphics")
+    fspx = os.path.join(work, "shaders", "spirv", "fspx")
+    carve = os.path.join(work, "shaders", "dxbc")
+    names = graphics_extraction_ok(extracted, extraction_settings)
+    index = graphics_translation_reusable(staged, settings, names)
+    if index is not None:
+        if index and not library_merged(staged, fspx, index):
+            log("shaders: the pipeline graphics programs are translated; publishing them into the shader corpus again")
+            merge_library_corpus(staged, fspx, owned=GRAPHICS_OWNED)
+        graphics_report(extracted, names, index, sorted(set(names) - set(index)))
+        return
+    log("shaders: extracting and translating the wanted pipeline graphics programs")
+    drop(os.path.join(staged, "index.json"), os.path.join(staged, GRAPHICS_BUILD_RECORD))
+    # The staged translation depends on the extraction and the translator: a run of either that differs must not keep
+    # a module from the run before.
+    if os.path.isdir(staged):
+        shutil.rmtree(staged)
+    os.makedirs(staged, exist_ok=True)
+    if names is None:
+        drop(os.path.join(extracted, GRAPHICS_EXTRACTED_RECORD))
+        if os.path.isdir(extracted):
+            shutil.rmtree(extracted)
+        # --stages none: the wanted list alone selects the programs, nothing by stage.
+        py("shader_library.py", rpf, "--out", extracted, "--stages", "none", "--disasm", "--carve", carve,
+           "--wanted", wanted, "--jobs", jobs)
+        names = graphics_extraction_complete(extracted)
+        if not names:
+            total = graphics_wanted_counts(extracted)[0]
+            if total:
+                fail(f"shaders: none of the {total} hashes in {wanted} name a program in {LIBRARY_RPF}'s program "
+                     "table, so there is nothing to publish. Check that the list belongs to this package.")
+            fail(f"shaders: the pipeline graphics extraction in {extracted} is incomplete (no readable index.json or "
+                 "wanted.json, or a program's sidecars or listing are missing). Run the shaders stage again; the tool "
+                 "output above is why.")
+        marker = os.path.join(extracted, GRAPHICS_EXTRACTED_RECORD) + ".tmp"
+        with open(marker, "w", encoding="utf-8", newline="\n") as f:
+            f.write(extraction_settings + "\n")
+        os.replace(marker, os.path.join(extracted, GRAPHICS_EXTRACTED_RECORD))
+    translate(os.path.join(extracted, "disasm"), staged, jobs, emulate=emulate, fallbacks=fallbacks)
+    index = graphics_translated(staged)
+    if index is None:
+        fail(f"shaders: rdna2spirv.py wrote no readable pipeline graphics translation in {staged}. Run the shaders "
+             "stage again; the translator's output above names each program it refused")
+    refused = sorted(set(names) - set(index))
+    if index:
+        merge_library_corpus(staged, fspx, owned=GRAPHICS_OWNED)
+    graphics_report(extracted, names, index, refused)
+    record = os.path.join(staged, GRAPHICS_BUILD_RECORD) + ".tmp"
+    with open(record, "w", encoding="utf-8", newline="\n") as f:
+        json.dump({"settings": settings, "refused": refused}, f)
+    os.replace(record, os.path.join(staged, GRAPHICS_BUILD_RECORD))
 
 
 WAVE64_MODES = ("auto", "on", "off")

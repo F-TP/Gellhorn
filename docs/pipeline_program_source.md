@@ -71,3 +71,38 @@ it is added.
 record tables are in its `library.json`. The captured dumps stay in the work folder, outside the repository. The fix
 is the zlib stage in the console DirectStorage shim (`runtime/shims/dstorage.cpp`). No GPU run was made in this
 investigation.
+
+Correction (later): the pipeline-library step is now a `make_game.py` stage (`library_shaders`), so the last paragraph
+of "Consequence for a fresh build" no longer applies.
+
+## The 1,266 graphics programs the next boot asks for
+
+**Status: implemented and measured on the work folder.** One retail boot at the current stop deserializes 9,943
+graphics pipeline records that reference only **1,266 distinct native programs (947 PS, 319 VS)**. Each is identified
+by the SHA-256 of its bytes as passed, which is the index's `fspx_code_sha256` key - the same key
+`create_compute` resolves compute programs with. The hash list is data: it stays outside the repository (a file named
+by `LEONIDA_GRAPHICS_PROGRAMS`, else `<work>/graphics_programs.json`) and is never committed or quoted.
+
+`tools/shader_library.py --wanted LIST.json` adds the programs whose stored bytes have those hashes to the
+extraction (whatever `--stages` selects; the extraction records the outcome in `<out>/wanted.json`). The new
+`make_game.py` step `graphics_shaders` extracts that selection into `<work>/shaders/pipeline_graphics`, translates it
+into `<work>/shaders/spirv/pipeline_graphics`, and publishes the entries in the FSPX index beside the compute
+library's (`merge_library_corpus`, entry names `lib_ps_*` and `lib_vs_*`): the runtime looks a program up by its
+stage and `fspx_code_sha256`, with the module at `fspx/<name>.spv`.
+
+Measured on the work folder: **1,266 of 1,266 hashes found** in the library's program table (947/947 PS, 319/319 VS),
+all 1,266 have a carved source container, all 1,266 translated and pass `spirv-val`, and each published
+`fspx_code_sha256` equals the wanted hash - so all 1,266 become resolvable. A build without the list does nothing:
+the step logs that it has no list and leaves the corpus as it is. The extraction (`extraction.json`) and the
+translation (`pipeline_graphics_build.json`) carry reuse markers, so a rerun is a publish-only no-op unless the
+package, the tools, llvm-mc, the wave64/fallback flags or the list changed.
+
+Publishing runs in the shaders stage, so the supported way to republish a work folder is (with `LLVM_MC`,
+`spirv-as` and `spirv-val` on `PATH`, as for the step itself; `scripts\build_llvm_mc.ps1` builds llvm-mc):
+
+```sh
+python -I make_game.py --game "<package>" --work "<work>" --stages shaders
+```
+
+The list is read from `<work>/graphics_programs.json` in that case; set `LEONIDA_GRAPHICS_PROGRAMS` to name another
+file. No hash or program byte of this selection is in the repository.

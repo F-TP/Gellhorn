@@ -21,13 +21,20 @@ and tools/rdna2spirv.py reads (fspx/<name>.code, fspx/<name>.json, index.json).
 
 Usage:
     python -I shader_library.py <shaders.rpf | library.bin> --out DIR [--stages cs,ps,vs,ms] [--disasm]
-                                [--mcpu gfx1013] [--jobs N]
+                                [--mcpu gfx1013] [--jobs N] [--wanted LIST.json --carve DIR]
     python -I shader_library.py <shaders.rpf> --save library.bin       # the reassembled file, nothing else
 
 DIR/library.json gets the header, both pipeline tables (stage -> program name) and the per-program stage. Programs
 are named lib_<stage>_<index>. The output is game data and must stay in the user's work folder.
+
+--wanted adds the programs a list of hashes names to the selection, whatever --stages says: LIST.json is
+{"ps": ["<sha256>", ...], "vs": ["<sha256>", ...]}, each hash the SHA-256 of a program's bytes as stored (the
+fspx_code_sha256 key of the index); a key whose value is not a list is a note and is ignored. DIR/wanted.json then
+records how many hashes each stage wanted and got, and the ones the library does not hold. The list is data and stays
+outside the repository.
 """
 import argparse
+import hashlib
 import json
 import mmap
 import os
@@ -221,6 +228,67 @@ def carve_digests(folder: str, errors=None) -> dict:
     return out
 
 
+def load_wanted(path: str) -> dict:
+    """A wanted list as {stage: set(sha256)}: JSON {"ps": [hash, ...], "vs": [hash, ...]}.
+
+    The stages are the list's own keys, not the library's: a hash listed under a stage the library gives the program
+    another stage for is a mismatch the caller reports rather than one to publish. A key whose value is not a list is
+    a note about the list (the work folder's file names its capture source), not a stage, and is ignored; anything
+    else raises LibraryError, so a malformed list stops the run instead of selecting nothing."""
+    try:
+        with open(path, encoding="utf-8-sig") as f:
+            data = json.load(f)
+    except (OSError, ValueError) as e:
+        raise LibraryError(f"cannot read the wanted list {path}: {e}") from None
+    if not isinstance(data, dict) or not data:
+        raise LibraryError(f"the wanted list {path} is not a JSON object of stage hash lists")
+    out = {}
+    for stage, hashes in data.items():
+        if not isinstance(hashes, list):
+            continue
+        if (not isinstance(stage, str) or not hashes
+                or not all(isinstance(h, str) and re.fullmatch(r"[0-9a-fA-F]{64}", h) for h in hashes)):
+            raise LibraryError(f"the wanted list {path}: {stage!r} is not a list of SHA-256 hex strings")
+        out[stage] = {h.lower() for h in hashes}
+    if not out:
+        raise LibraryError(f"the wanted list {path} names no stage hash list")
+    return out
+
+
+def wanted_matches(b: bytes, lib: dict, wanted: dict) -> "tuple[dict, dict, dict]":
+    """(program index -> wanted stage) for the hashes it finds, and the ones it does not.
+
+    A program's identity is the SHA-256 of its bytes as stored, which is the value the extraction writes as the
+    index's fspx_code_sha256 and the runtime looks a program up by. The second dict maps a wanted stage to the
+    hashes no program's bytes have, the third to the hashes whose program the library gives another stage."""
+    base = lib["layout"]["code"]
+    by_hash = {}
+    for i, (o, s) in enumerate(lib["programs"]):
+        by_hash.setdefault(hashlib.sha256(b[base + o: base + o + s]).hexdigest(), i)
+    matched, missing, other = {}, {}, {}
+    for stage, hashes in wanted.items():
+        missing[stage], other[stage] = [], []
+        for h in sorted(hashes):
+            i = by_hash.get(h)
+            if i is None:
+                missing[stage].append(h)
+            elif stage not in lib["stage"].get(i, set()):
+                other[stage].append(h)
+            else:
+                matched.setdefault(i, stage)
+    return matched, missing, other
+
+
+def wanted_report(wanted: dict, matched: dict, missing: dict, other: dict) -> dict:
+    """What DIR/wanted.json records: per stage the hashes wanted, found and not found, and the found programs' names
+    are in index.json beside it."""
+    found = {stage: sum(1 for st in matched.values() if st == stage) for stage in wanted}
+    return {"wanted": {stage: len(hashes) for stage, hashes in wanted.items()},
+            "found": found,
+            "missing": {stage: list(hashes) for stage, hashes in missing.items()},
+            "other_stage": {stage: list(hashes) for stage, hashes in other.items()}}
+
+
 def blob(b: bytes, lib: dict, i: int) -> bytes:
     o, s = lib["blobs"][i]
     base = lib["layout"]["blob_data"]
@@ -260,12 +328,16 @@ def main(argv=None) -> int:
     ap.add_argument("--out", help="output folder (library.json, index.json, fspx/, disasm/)")
     ap.add_argument("--save", help="write the reassembled library file here")
     ap.add_argument("--stages", default="cs,ps,vs,ms",
-                    help="stages whose programs to write (default cs,ps,vs,ms; 'all' adds the unidentified slot)")
+                    help="stages whose programs to write (default cs,ps,vs,ms; 'all' adds the unidentified slot; "
+                         "'none' writes only what --wanted selects)")
     ap.add_argument("--disasm", action="store_true", help="also write disasm/<name>.s (needs llvm-mc, see LLVM_MC)")
     ap.add_argument("--mcpu", default="gfx1013", help="llvm-mc CPU for --disasm (default gfx1013)")
     ap.add_argument("--carve", help="a tools/shader_carve.py output folder: name each program's source shader by the "
                                     "digest its resource-layout blob ends with (the container's HASH part), and "
                                     "copy that container to <name>.dxbc for the translator's signature reads")
+    ap.add_argument("--wanted", help="JSON list of SHA-256 hashes ({'ps': [...], 'vs': [...]}): also write the "
+                                     "library programs whose bytes have those hashes, whatever --stages selects "
+                                     "(the extraction then records the outcome in <out>/wanted.json)")
     ap.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 2) // 2),
                     help="llvm-mc processes for --disasm (default: half the CPUs)")
     a = ap.parse_args(argv)
@@ -273,6 +345,8 @@ def main(argv=None) -> int:
         ap.error("--jobs must be at least 1")
     if not a.out and not a.save:
         ap.error("give --out, --save or both")
+    if a.wanted and not a.out:
+        ap.error("--wanted needs --out")
     with open(a.src, "rb") as f:
         head = f.read(4)
         f.seek(0)
@@ -293,7 +367,9 @@ def main(argv=None) -> int:
     if not a.out:
         print(f"library: {len(b)} bytes written to {a.save}")
         return 0
-    want = None if a.stages == "all" else set(a.stages.split(","))
+    want = None if a.stages == "all" else (set() if a.stages == "none" else set(a.stages.split(",")))
+    wanted = load_wanted(a.wanted) if a.wanted else None
+    matches, missing, other = (wanted_matches(b, lib, wanted) if wanted is not None else ({}, {}, {}))
     os.makedirs(os.path.join(a.out, "fspx"), exist_ok=True)
     disasm = None
     if a.disasm:
@@ -308,7 +384,7 @@ def main(argv=None) -> int:
     for i in range(lib["header"]["programs"]):
         stages = lib["stage"].get(i, set())
         st = "+".join(sorted(stages)) if stages else "unused"
-        if want is not None and not stages & want:
+        if not (i in matches or want is None or stages & want):
             continue
         code = program(b, lib, i)
         start, end = code_range(code)
@@ -377,6 +453,10 @@ def main(argv=None) -> int:
         json.dump(summary, f, indent=1)
     with open(os.path.join(a.out, "index.json"), "w", encoding="utf-8", newline="\n") as f:
         json.dump(index, f, indent=1)
+    if wanted is not None:
+        report = wanted_report(wanted, matches, missing, other)
+        with open(os.path.join(a.out, "wanted.json"), "w", encoding="utf-8", newline="\n") as f:
+            json.dump(report, f, indent=1)
     h = lib["header"]
     print(f"library {h['name']} {h['version']}: {h['graphics']} graphics + {h['compute']} compute pipelines, "
           f"{h['programs']} programs; {written} written to {a.out}")
@@ -386,6 +466,15 @@ def main(argv=None) -> int:
                  f"{'s' if len(carve_errors) != 1 else ''}") if carve_errors else ""
         print(f"{linked} of {written} named by a carved shader's HASH digest, "
               f"{written - linked} not in the carve{extra}")
+    if wanted is not None:
+        by_stage = ", ".join(f"{report['found'][stage]}/{report['wanted'][stage]} {stage}"
+                             for stage in sorted(wanted))
+        print(f"wanted: {sum(report['found'].values())} of {sum(report['wanted'].values())} programs found in the "
+              f"library ({by_stage}); {written} written")
+        gone = sum(len(v) for v in report["missing"].values())
+        else_stage = sum(len(v) for v in report["other_stage"].values())
+        if gone or else_stage:
+            print(f"wanted: {gone} hashes name no program's bytes and {else_stage} name a program of another stage")
     return 0
 
 
