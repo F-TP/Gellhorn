@@ -1784,20 +1784,22 @@ HRESULT proxy_create_graphics_pipeline_probe(DeviceProxy* self, const void* desc
                 const std::uint64_t address = words[2 * pair + 1];
                 const std::uint64_t size = words[2 * pair + 2];
                 if (!address || !size || !readable_range(reinterpret_cast<const void*>(address), 1)) continue;
-                std::uint64_t digest = 0xcbf29ce484222325ull;
                 const auto* code = reinterpret_cast<const std::uint8_t*>(address);
-                const std::uint64_t covered = size < 512 ? size : 512;
-                for (std::uint64_t i = 0; i < covered; ++i) digest = (digest ^ code[i]) * 0x100000001b3ull;
+                if (size > (1ull << 20) || !readable_range(code, static_cast<std::size_t>(size))) continue;
+                // SHA-256 of the program bytes as passed is exactly the index's fspx_code_sha256, the key
+                // create_compute already resolves with - so this list is directly the build's to-translate list.
+                const std::string sha = leonida::sha256_hex(
+                    std::span<const std::uint8_t>(code, static_cast<std::size_t>(size)));
                 static std::mutex program_mutex;
-                static std::set<std::pair<std::uint64_t, std::uint64_t>> seen_programs[2];
+                static std::set<std::string> seen_programs[2];
                 bool first_program = false;
                 {
                     const std::lock_guard lock(program_mutex);
-                    first_program = seen_programs[slot].insert({size, digest}).second;
+                    first_program = seen_programs[slot].insert(sha).second;
                 }
                 if (first_program)
-                    std::fprintf(stderr, "[rt] d3d12_xs: slot 57 program %d: %llu B fnv %016llx\n", slot,
-                                 static_cast<unsigned long long>(size), static_cast<unsigned long long>(digest));
+                    std::fprintf(stderr, "[rt] d3d12_xs: slot 57 program %d: %llu B sha256 %s\n", slot,
+                                 static_cast<unsigned long long>(size), sha.c_str());
             }
         }
     }
