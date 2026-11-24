@@ -395,6 +395,19 @@ int wmain(int argc, wchar_t** argv) {
             rt::startup_trace::set_poke_log(addresses, originals, count);
             std::fflush(stdout);
         }
+        // LEONIDA_BACK_IMAGES=1 commits zeroed memory over the console image-address range, which starts at 4 GiB. Our
+        // descriptor code hands that range out as a texture's address on the strength of "nothing dereferences it" - but
+        // the title has now been measured dereferencing exactly 0x100000000 as a pointer. With the range committed, the
+        // read returns zero instead of faulting, which says whether the title treats that address as memory (and what it
+        // does with what it finds there).
+        if (std::getenv("LEONIDA_BACK_IMAGES")) {
+            void* const want = reinterpret_cast<void*>(static_cast<std::uintptr_t>(1) << 32);
+            constexpr std::size_t bytes = 64ull << 20;
+            void* const got = VirtualAlloc(want, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+            std::printf("[rt] backed the console image range at %p (%zu MiB): %s\n", want, bytes >> 20,
+                        got ? "committed" : "failed");
+            std::fflush(stdout);
+        }
         std::printf("running %s\n", main_module.name.c_str());
         std::fflush(stdout);
         // LEONIDA_WATCH_GLOBAL=<hex rva> logs every change of a mapped image's 8-byte global with the millisecond it

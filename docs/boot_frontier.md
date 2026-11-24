@@ -311,3 +311,33 @@ The new stop is the same class one layer on: a global 72-byte-record array (`ima
 written to it. A watcher over that global sees no transition at all during the boot, so whatever populates it never runs;
 no direct store to it exists in the image, so it is filled through a computed pointer, and the next step is to find which
 subsystem's failure skips that initialisation rather than the writer itself.
+
+
+## Frontier 2026-11-24: the title reads our fabricated GPU address as CPU memory
+
+The stop after the TLS rewrite landed at `game+0x2484133`, a read of address `0x100000000`. The value in `rbx` there is
+exactly `1 << 32`, and `d3d12_vulkan_device.cpp` hands out console image addresses starting at `std::uint64_t(1) << 32`
+(256 bytes apart) with the comment "Nothing dereferences it". **That comment is now falsified by measurement**: the title
+dereferences the address as a CPU pointer.
+
+Evidence:
+
+1. A hardware-free probe (poking an int3 over the faulting instruction) logs `rbx = 0x100000000`, `rax = 1` immediately
+   before the fault, and the trap fires on every pass - the block is reached by a computed transfer, not the fall-through
+   path that a linear disassembly shows, which is why tracing the preceding `lea` never explained the value.
+2. A poke at the call's return address never fires, confirming the indirect entry.
+3. `LEONIDA_BACK_IMAGES=1` commits 64 MiB of zeroed memory at `0x100000000`. The read then **succeeds** and the fault
+   moves to `game+0x2484140`, a write to `0x121A4` - a null pointer plus that offset, because our memory holds zero where
+   the console would hold a pointer.
+
+Interpretation: on the console, a resource's GPU virtual address is also a CPU address (unified memory). The title reads
+through a T# image address expecting live data. Our Vulkan backend fabricates addresses in that range that are not
+mapped, and no data is ever written there.
+
+What this implies for the runtime: resource GPU addresses must become CPU-accessible at the address the title is handed -
+either by backing the console address range and keeping it coherent with what shaders write, or by making the fabricated
+address resolve to the resource's host memory. The descriptor-heap work already does this for heap memory
+(`console_heap_back`, placeholder views); resource memory needs the same treatment.
+
+Cross-reference: the public attempt (VIctory) does not need this, because it runs the title on host D3D12 where the
+console's GPU virtual addresses are the host's own resource addresses.
