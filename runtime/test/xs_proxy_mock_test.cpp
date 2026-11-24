@@ -1013,13 +1013,13 @@ int check_tail(bool want_guarded) {
     EXPECT(queue && fence);
     EXPECT(xs::command_object_tables_guarded() == want_guarded);
     Mock* const queue_mock = reinterpret_cast<Mock*>(xs::queue_proxy_real_queue(queue));
-    // Signal (14) still reaches the real queue, with the real fence.
-    EXPECT(hr_of(raw(queue, 14, word(fence), 5)) == S_OK && queue_mock->calls[14] == 1 &&
+    // Signal is console slot 16 and reaches PC Signal (real slot 14), with the real fence unwrapped.
+    EXPECT(hr_of(raw(queue, 16, word(fence), 5)) == S_OK && queue_mock->calls[14] == 1 &&
            queue_mock->args[14][0] == word(xs::fence_proxy_real_fence(fence)) && queue_mock->args[14][1] == 5);
     // Slot 35 is no longer part of the refused tail: the title calls it at two measured sites as (this, arg, pair*),
     // and the proxy answers a clock calibration pair instead of E_NOTIMPL (check_queue_console_slots checks the pair
     // itself). The rest of the tail keeps the refused behaviour, and never reaches the real queue.
-    for (unsigned slot = 19; slot < xs::queue_proxy_table_size(); ++slot) {
+    for (unsigned slot = 21; slot < xs::queue_proxy_table_size(); ++slot) {  // 16..20 map to PC 14..18
         if (slot == 35) continue;
         EXPECT(hr_of(raw(queue, slot)) == E_NOTIMPL && queue_mock->calls[slot] == 0);
     }
@@ -1042,7 +1042,21 @@ int check_queue_console_slots() {
     EXPECT(real_queue && real_queue->kind == Kind::queue);
     xs::reset_device_proxy_stats();
 
-    // Slot 18, GetDesc. Measured: the title calls it as (queue in RCX, buffer in RDX), while our real queue is a C++
+    // The console queue inserts two methods before Signal (docs/d3d12_xs_surface.md's PresentX slot-30/32 split), so
+    // console slots 16..20 name PC slots 14..18. Measured on the title: Signal at console 16, GetTimestampFrequency at
+    // console 18, GetDesc at console 20. Forwarded by number, console Signal reached PC GetTimestampFrequency, which
+    // stored 1e9 through the fence it was given - that is the corruption this mapping exists to stop.
+    EXPECT(hr_of(raw(queue, 16)) == S_OK && real_queue->calls[14] == 1);   // Signal -> PC Signal
+    EXPECT(hr_of(raw(queue, 17)) == S_OK && real_queue->calls[15] == 1);   // Wait -> PC Wait
+    EXPECT(hr_of(raw(queue, 18)) == S_OK && real_queue->calls[16] == 1);   // GetTimestampFrequency
+    EXPECT(hr_of(raw(queue, 19)) == S_OK && real_queue->calls[17] == 1);   // GetClockCalibration
+    // The two inserted methods are not identified, so they must refuse rather than land on PC Signal/Wait.
+    const unsigned signal_before = real_queue->calls[14];
+    EXPECT(hr_of(raw(queue, 14)) == E_NOTIMPL && real_queue->calls[14] == signal_before);
+    EXPECT(hr_of(raw(queue, 15)) == E_NOTIMPL && real_queue->calls[15] == 1);
+
+    // Slot 20, GetDesc (PC slot 18). Measured: the title calls it as (queue in RCX, buffer in RDX), while our real queue
+    // is a C++
     // object whose GetDesc returns D3D12_COMMAND_QUEUE_DESC by value, so MSVC's method takes the hidden return buffer
     // in RCX and the object in RDX. Forwarded through the generic path the descriptor landed in the front of the real
     // queue object and the title's buffer kept its old contents (measured: the title read 1 << 32 from it and faulted
@@ -1052,9 +1066,11 @@ int check_queue_console_slots() {
     std::uint8_t front_before[16], front_after[16];
     std::memcpy(front_before, real_queue, sizeof(front_before));
     real_queue->get_desc_hidden = real_queue->get_desc_self = 0;
-    EXPECT(hr_of(raw(queue, 18, word(buffer))) == S_OK);
+    const unsigned desc_calls_before = real_queue->calls[18];
+    const unsigned desc_hits_before = xs::queue_slot_hits(20);
+    EXPECT(hr_of(raw(queue, 20, word(buffer))) == S_OK);
     std::memcpy(front_after, real_queue, sizeof(front_after));
-    EXPECT(xs::queue_slot_hits(18) == 1 && real_queue->calls[18] == 1);
+    EXPECT(xs::queue_slot_hits(20) == desc_hits_before + 1 && real_queue->calls[18] == desc_calls_before + 1);
     // (a) the hidden return pointer is the buffer the title passed in RDX...
     EXPECT(real_queue->get_desc_hidden == word(buffer));
     // (b) ...and the object pointer is the mock real queue, not the title's buffer.
@@ -1088,8 +1104,10 @@ int check_queue_console_slots() {
 
     EXPECT(release(queue) == 0 && real_queue->refs == 0);
     EXPECT(release(device) == 0 && mock->refs == 0);
-    std::printf("%s: queue slot 18 converts GetDesc's console struct-return order (the title's buffer gets the "
-                "descriptor, the real queue is the object, its front words untouched) and slot 35 answers a calibration "
+    std::printf("%s: the console queue's two-method shift maps Signal/Wait/GetTimestampFrequency/GetClockCalibration/"
+                "GetDesc from slots 16..20 to PC 14..18, the inserted methods refuse, slot 20 converts GetDesc's console "
+                "struct-return order (the title's buffer gets the descriptor, the real queue is the object, its front "
+                "words untouched) and slot 35 answers a calibration "
                 "pair when the out pointer is writable and S_OK without writing otherwise\n", g_label);
     return 0;
 }

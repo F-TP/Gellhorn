@@ -723,6 +723,16 @@ static_assert(kQueueSlots * sizeof(void*) <= 4096 && kFenceSlots * sizeof(void*)
               "a table must fit in the first page of its reservation");
 
 constexpr unsigned kQueueSignal = 14, kQueueWait = 15;  // (ID3D12Fence*, UINT64)
+// The console queue inserts two methods before Signal (docs/d3d12_xs_surface.md records the public PresentX slot-30/32
+// split "with two methods inserted before Signal"). Measured on this title: its Signal is console slot 16 and its GetDesc
+// is console slot 20, so console slots 16..20 are PC slots 14..18. Slots 14 and 15 are the inserted methods, shapes
+// not yet identified.
+constexpr unsigned kConsoleQueueShift = 2;                 // console slot = PC slot + 2 from Signal on
+constexpr unsigned kConsoleQueueSignal = 16;               // (ID3D12Fence*, UINT64)
+constexpr unsigned kConsoleQueueWait = 17;                 // (ID3D12Fence*, UINT64)
+constexpr unsigned kConsoleQueueTimestampFrequency = 18;   // (UINT64*)
+constexpr unsigned kConsoleQueueClockCalibration = 19;     // (UINT64*, UINT64*)
+constexpr unsigned kConsoleQueueGetDesc = 20;              // returns D3D12_COMMAND_QUEUE_DESC by value
 
 struct ChildProxy {
     void** vtable;          // offset 0: the caller's ID3D12CommandQueue* / ID3D12Fence* points here
@@ -755,14 +765,16 @@ template <ChildKind K>
 const char* child_public_name(unsigned slot) {
     static constexpr const char* object[] = {"QueryInterface", "AddRef", "Release", "GetPrivateData",
                                              "SetPrivateData", "SetPrivateDataInterface", "SetName", "GetDevice"};
+    // Console order: PC's Signal/Wait positions hold the console's two inserted methods, and the rest are shifted two.
     static constexpr const char* queue[] = {"UpdateTileMappings", "CopyTileMappings", "ExecuteCommandLists",
-                                            "SetMarker", "BeginEvent", "EndEvent", "Signal", "Wait",
-                                            "GetTimestampFrequency", "GetClockCalibration", "GetDesc"};
+                                            "SetMarker", "BeginEvent", "EndEvent", "console method 14",
+                                            "console method 15", "Signal", "Wait", "GetTimestampFrequency",
+                                            "GetClockCalibration", "GetDesc"};
     static constexpr const char* fence[] = {"GetCompletedValue", "SetEventOnCompletion", "Signal",
                                             "GetCreationFlags"};
     if (slot < 8) return object[slot];
     if constexpr (K == ChildKind::queue) {
-        if (slot < kQueuePublicSlots) return queue[slot - 8];
+        if (slot <= kConsoleQueueGetDesc) return queue[slot - 8];
     } else if constexpr (K == ChildKind::fence) {
         if (slot < kFence1PublicSlots) return fence[slot - 8];
     } else {
@@ -1261,7 +1273,7 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
         d3d12_trace::record(child_trace_name<K>(Slot));
         return hr_to_u64(child_get_device<K>(self, reinterpret_cast<const IID*>(a1),
                                              reinterpret_cast<void**>(a2)));
-    } else if constexpr (K == ChildKind::queue && Slot == kQueueGetDesc) {
+    } else if constexpr (K == ChildKind::queue && Slot == kConsoleQueueGetDesc) {
         // The title calls this as (this, buffer): the queue object in RCX and the D3D12_COMMAND_QUEUE_DESC it wants in
         // RDX. Our queue is a C++ object whose GetDesc returns that struct by value, so MSVC wants the hidden return
         // pointer in RCX and the object in RDX - the opposite order. Forwarded through the generic path, the descriptor
@@ -1270,10 +1282,23 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
         note_child_slot<K>(Slot);
         d3d12_trace::record(child_trace_name<K>(Slot));
         using GetDescFn = void(WINAPI*)(void*, void*);
-        auto* const method = reinterpret_cast<GetDescFn>(self->real_vtable[Slot]);
+        auto* const method = reinterpret_cast<GetDescFn>(self->real_vtable[kQueueGetDesc]);
         method(reinterpret_cast<void*>(a1), self->real);
         return 0;
-    } else if constexpr (K == ChildKind::queue && Slot == 35) {
+    } else if constexpr (K == ChildKind::queue && (Slot == 14 || Slot == 15)) {
+        // The console's two methods inserted before Signal; their shapes are not identified, and forwarding them by
+        // number reached PC Signal/Wait, which is wrong by construction. Refusing keeps the call honest and logged.
+        note_child_slot<K>(Slot);
+        static std::atomic<bool> inserted_logged[2] = {};
+        if (!inserted_logged[Slot - 14].exchange(true, std::memory_order_relaxed))
+            std::fprintf(stderr,
+                         "[rt] d3d12_xs: queue slot %u is one of the console's two methods before Signal; refusing "
+                         "(args 0x%llx 0x%llx 0x%llx 0x%llx)\n",
+                         Slot, static_cast<unsigned long long>(a1), static_cast<unsigned long long>(a2),
+                         static_cast<unsigned long long>(a3), static_cast<unsigned long long>(a4));
+        d3d12_trace::record(child_trace_name<K>(Slot), "unsupported");
+        return hr_to_u64(E_NOTIMPL);
+} else if constexpr (K == ChildKind::queue && Slot == 35) {
         // A console queue extension past the PC table. Measured from the title's call sites: it is called as
         // (this, arg, pair*) and the caller reads two 64-bit values back from the second argument, so leaving them
         // unwritten left stack garbage that the title later used as a pointer (observed: a read at 0x100000000).
@@ -1302,7 +1327,13 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
         return hr_to_u64(S_OK);
     } else {
         note_child_slot<K>(Slot);
-        if (Slot >= self->slot_count) {
+        // Console order: slots from Signal on name the PC method two below them (heap and allocator proxies keep their
+        // own numbering, so only the queue maps).
+        constexpr unsigned real_slot =
+            (K == ChildKind::queue && Slot >= kConsoleQueueSignal && Slot <= kConsoleQueueGetDesc)
+                ? Slot - kConsoleQueueShift
+                : Slot;
+        if (real_slot >= self->slot_count) {
             bool expected = false;
             if (ChildStats<K>::beyond_warned[Slot].compare_exchange_strong(expected, true,
                                                                             std::memory_order_relaxed)) {
@@ -1317,7 +1348,8 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
             return hr_to_u64(E_NOTIMPL);
         }
         d3d12_trace::record(child_trace_name<K>(Slot));  // "called": the real object's result is not inspected
-        if constexpr (K == ChildKind::queue && (Slot == kQueueSignal || Slot == kQueueWait)) a1 = unwrap_object(a1);
+        if constexpr (K == ChildKind::queue && (real_slot == kQueueSignal || real_slot == kQueueWait))
+            a1 = unwrap_object(a1);
         UnwrappedArray unwrapped_lists;
         if constexpr (K == ChildKind::queue && Slot == 10) {
             if (!unwrapped_lists.fill(a2, a1)) return hr_to_u64(E_OUTOFMEMORY);
@@ -1330,7 +1362,8 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
                                                  std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t,
                                                  std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t,
                                                  std::uint64_t, std::uint64_t, std::uint64_t);
-        auto fn = reinterpret_cast<ForwardFn>(self->real_vtable[Slot]);
+        // The console slot names this PC method, not the one at the same index.
+        auto fn = reinterpret_cast<ForwardFn>(self->real_vtable[real_slot]);
         return fn(self->real, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14);
     }
 }
