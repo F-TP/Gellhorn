@@ -164,6 +164,7 @@ const char* slot_name(unsigned slot) {
         case 46: return "SetResidencyPriority (proxies unwrapped)";
         case 48: return "Xbox CreateCommandQueueX -> queue proxy";
         case 50: return "EnqueueMakeResident (proxies unwrapped)";
+        case 57: return "Xbox CreateGraphicsPipelineState (probed)";
         case 62: return "Xbox CreateComputePipelineState";
         case 67: return "Xbox DeserializeComputePipelineStateX";
         case 73: return "Xbox CreateCommandListX -> PC CreateCommandList";
@@ -1722,6 +1723,53 @@ HRESULT proxy_create_compute_pipeline_state(DeviceProxy* self, const D3D12_COMPU
     return self->real->CreateComputePipelineState(desc, *riid, out);
 }
 
+// The Xbox slot 57 is the console's graphics PSO creation: the title passes a description in a1, the IID in a2 and the
+// out pointer in a3, and the descriptor's first words are a root signature followed by pointer/size shader pairs, i.e. a
+// D3D12_GRAPHICS_PIPELINE_STATE_DESC shape. The console's graphics description is not in the public GDK reference
+// (docs/xbox_d3d12_xs.md 5.3), so the layout is measured here rather than assumed: the first call dumps the descriptor's
+// words and the first four bytes of each of the five shader code pointers, which says whether the console passes DXBC or
+// native code and where each stage sits. Until the conversion is written the call refuses, as it did before.
+HRESULT proxy_create_graphics_pipeline_probe(DeviceProxy* self, const void* desc, const IID* riid, void** out) {
+    (void)self;
+    note_slot(57);
+    if (!out) return E_POINTER;
+    *out = nullptr;
+    if (!desc) return E_INVALIDARG;
+    if (!riid) return E_POINTER;
+    static std::atomic<bool> logged{false};
+    if (!logged.exchange(true, std::memory_order_relaxed)) {
+        const auto* words = static_cast<const std::uint64_t*>(desc);
+        std::fprintf(stderr, "[rt] d3d12_xs: slot 57 probe: riid %08lx-%04x-%04x, %u words:\n",
+                     static_cast<unsigned long>(riid->Data1), riid->Data2, riid->Data3, 40u);
+        for (int i = 0; i < 40; i += 4) {
+            std::fprintf(stderr, "[rt]   +%02x: %016llx %016llx %016llx %016llx\n", 8 * i,
+                         static_cast<unsigned long long>(words[i]), static_cast<unsigned long long>(words[i + 1]),
+                         static_cast<unsigned long long>(words[i + 2]), static_cast<unsigned long long>(words[i + 3]));
+        }
+        // The five stage pairs a D3D12_GRAPHICS_PIPELINE_STATE_DESC puts at +0x08: VS, PS, DS, HS, GS.
+        for (int stage = 0; stage < 5; ++stage) {
+            const auto* pair = reinterpret_cast<const std::uint64_t*>(
+                static_cast<const std::uint8_t*>(desc) + 0x08 + 0x10 * static_cast<std::size_t>(stage));
+            const auto address = static_cast<std::uintptr_t>(pair[0]);
+            const std::uint64_t size = pair[1];
+            char head[5] = {0};
+            MEMORY_BASIC_INFORMATION mbi{};
+            const bool readable = address &&
+                                  VirtualQuery(reinterpret_cast<const void*>(address), &mbi, sizeof(mbi)) ==
+                                      sizeof(mbi) &&
+                                  mbi.State == MEM_COMMIT && !(mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD));
+            if (readable)
+                for (int b = 0; b < 4; ++b) head[b] = static_cast<char>(reinterpret_cast<const std::uint8_t*>(address)[b]);
+            std::fprintf(stderr, "[rt]   stage %d at +%02x: code %p size %llu first bytes %02x %02x %02x %02x (%s)\n",
+                         stage, 0x08 + 0x10 * stage, reinterpret_cast<void*>(address),
+                         static_cast<unsigned long long>(size), static_cast<unsigned char>(head[0]),
+                         static_cast<unsigned char>(head[1]), static_cast<unsigned char>(head[2]),
+                         static_cast<unsigned char>(head[3]), readable ? "readable" : "unreadable");
+        }
+    }
+    return E_NOTIMPL;
+}
+
 // The Xbox slot 67 creates a compute pipeline from native GPU code: (desc, riid, out), named
 // DeserializeComputePipelineStateX in amd_fidelityfx_upscaler_xbox.dll's messages (call at RVA 0x56d9). The desc
 // passes the root signature at +0x00, followed by pointer/size pairs for the shader's FSPX entries (docs/fspx.md):
@@ -1952,6 +2000,10 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
         // title address, so this is not the PC CreateMetaCommand the slot number would forward to. Refuse instead of
         // calling a method with the wrong arity; the probe above already names the arguments.
         return hr_to_u64(E_NOTIMPL);
+    } else if constexpr (Slot == 57) {
+        return hr_to_u64(proxy_create_graphics_pipeline_probe(
+            self, reinterpret_cast<const void*>(a1), reinterpret_cast<const IID*>(a2),
+            reinterpret_cast<void**>(a3)));
     } else if constexpr (Slot == 62) {
         return hr_to_u64(proxy_create_compute_pipeline_state(
             self, reinterpret_cast<const D3D12_COMPUTE_PIPELINE_STATE_DESC*>(a1), a2, a3,

@@ -396,3 +396,23 @@ Every `CreateLifetimeTracker` call leaves the title with a null tracker, and the
 pointer, so a tracker object is the first thing to rule in or out: an earlier prototype regressed the boot (D3D12 calls
 11,894 -> 1,653) through a wrong vtable slot, which means the interface order must be exact, and the run has to be
 compared against 11,986 calls and the `game+0xcc2861` stop before the change is kept.
+
+## Frontier 2026-11-24 (slot 57 measured)
+
+Console device slot 57 is not the PC method its index reaches: with the proxy forwarding it by position it became
+ID3D12Device5::CreateLifetimeTracker, which refused 10,242 times in one boot. Probed instead of assumed, the call is
+**graphics PSO creation**:
+
+* 
+iid is IID_ID3D12PipelineState (765a30f3-f624-4c6f), not a tracker IID.
+* The descriptor at a1 starts with the root signature and then **six** pointer/size pairs, 0x10 bytes each: VS at +0x08
+  (388 B), PS at +0x18 (188 B), DS at +0x28 (448 B), HS at +0x38 (208 B), GS at +0x48 (384 B), and a sixth at +0x58
+  (752 B). Everything after +0x68 is zero in the first call.
+* The code is **native, not DXBC** (first bytes 08 d8 05 40, 56 6e 6f ea, ...), i.e. the same kind of program the
+  compute slot 67 wraps as an FSPX kind-6 payload before the device resolves it from the shader index.
+
+So the 10,242 refusals are failed graphics pipeline creations, and the null the title later dereferences is a pipeline
+state it never received. The conversion to write: build a PC D3D12_GRAPHICS_PIPELINE_STATE_DESC from this descriptor,
+wrap each stage's native program the way slot 67 wraps compute code, identify the sixth pair (the count suggests a
+mesh/amplification pair the console descriptor carries), and route to CreateGraphicsPipelineState. Until then the probe
+refuses, exactly as the forwarded slot did.
