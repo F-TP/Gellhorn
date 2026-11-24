@@ -5,7 +5,7 @@ Each row carries area, state and a one-line evidence. Counts, error classes and 
 paths, shader bytes or hashes. Maintained by the issue-tracker agent as a standing, read-only-plus-this-file role.
 
 **Repo:** `F:\leonida`, branch `main`, HEAD `fb93cf28c` · **GitHub:** [luizwidmer/palmetto](https://github.com/luizwidmer/palmetto)
-**Updated:** 2026-11-24 · **Incoming:** 2 open (#2, #3 + 1 third-party comment) · **Ours open:** 5 (O1=#4, O3, O4, O5, O6) · **Fixed:** 6 · **Open PRs:** 0.
+**Updated:** 2026-11-24 · **Incoming:** 2 open (#2, #3 + 1 third-party comment) · **Ours open:** 5 (O1=#4, O3, O4, O5, O6) · **Fixed:** 6 · **#5 closed:** 1 · **Open PRs:** 0.
 
 **Policy: ledger only.** Do not open, comment on, close, delete or edit GitHub issues/PRs, or commit/push, without an
 explicit ask. Draft replies below are for lead approval; nothing has been posted.
@@ -48,7 +48,7 @@ the title never received. O3's remaining pieces are the highest-value debugging 
 
 | area | item | state | evidence |
 |---|---|---|---|
-| runtime | Console queue slot 18 `GetDesc` struct-return order (the clobbered `rbx` at `game+0x2484133`) | fixed `4178c742c` | stop moved to `game+0xcc2861`, D3D12 calls 11,906 → 11,986 (was O2; GH #5 open — close on approval) |
+| runtime | Console queue slot 18 `GetDesc` struct-return order (the clobbered `rbx` at `game+0x2484133`) | fixed `4178c742c` | stop moved to `game+0xcc2861`, D3D12 calls 11,906 → 11,986 (was O2; GH #5 closed as completed on this evidence) |
 | build | Pipeline-library extraction and FSPX listing repair wired into `make_game.py` | fixed `0276f2b1f` | FSPX 29/29 with the repair (22/29 without); library 42/42 on the 42-program extraction, 1,047/1,684 on a real package subset |
 | runtime | DirectStorage zlib stage inflates instead of failing with `E_NOTIMPL` | fixed `ae876f4b5` | 2,238 → 11,894 D3D12 calls; 0 zlib requests fail |
 | runtime | AMD-only `clzero` emulated on Intel hosts | fixed `f76446847` | illegal-instruction fault gone; frame-loop event waits reached, 11,906 calls, 0 pipeline failures |
@@ -64,6 +64,10 @@ the title never received. O3's remaining pieces are the highest-value debugging 
   on a real package subset (`0276f2b1f`); the FSPX set needs the `widen_smem_decode` repair. Not a boot front today.
 - **Historical: the eleven "missing" pipeline programs** were zeroed library reads from the refused zlib stage, not a
   second container or a load-time patch; resolved by `ae876f4b5` (see `docs/pipeline_program_source.md`).
+- **External (GH #3, NinosTech): FSPX lookups can succeed and the frame still be black.** Four FSPX translations from an
+  older revision cleared four lookup misses and made the 42 compute-pipeline calls succeed, yet the captured frame had
+  0 non-black pixels of 896,232. Matching his four programs to our cases needs his hashes; ask only if/when replies are
+  approved.
 - **Lifetime-tracker prototype (evidence, not a fix).** Implemented correctly and unit-tested, then reverted because the
   boot regressed 11,986 → 1,653 calls through a wrong vtable slot — evidence that console slot 57 is not a tracker (`O4`).
 - **docs.** `docs/competitor_intel.md` records how the public attempt (<https://github.com/Marvisak/VIctory>) is built
