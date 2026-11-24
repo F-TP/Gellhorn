@@ -385,6 +385,29 @@ inline bool skip_int3(EXCEPTION_POINTERS* info) {
                 std::fflush(stderr);
             }
         }
+        // Four qwords at rax and at rsi, when readable: the object a caller loaded a null out of is usually reachable
+        // through one of those two, and its neighbours say which structure it is.
+        for (int which = 0; which < 2; ++which) {
+            const auto address = static_cast<std::uintptr_t>(which ? c.Rsi : c.Rax);
+            MEMORY_BASIC_INFORMATION mbi{};
+            char line[160];
+            int used = std::snprintf(line, sizeof(line), "[rt] poke mem %s %p:", which ? "rsi" : "rax",
+                                     reinterpret_cast<void*>(address));
+            if (address && used > 0 &&
+                VirtualQuery(reinterpret_cast<const void*>(address), &mbi, sizeof(mbi)) == sizeof(mbi) &&
+                mbi.State == MEM_COMMIT && !(mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD))) {
+                const auto* words = reinterpret_cast<const std::uint64_t*>(address);
+                for (int w = 0; w < 4 && used > 0 && used < static_cast<int>(sizeof(line)) - 24; ++w)
+                    used += std::snprintf(line + used, sizeof(line) - used, " %llx",
+                                          static_cast<unsigned long long>(words[w]));
+            }
+            if (used > 0 && used < static_cast<int>(sizeof(line)) - 2) {
+                line[used++] = '\n';
+                line[used] = '\0';
+                std::fwrite(line, 1, static_cast<size_t>(used), stderr);
+                std::fflush(stderr);
+            }
+        }
         auto* const originals = poke_log_originals();
         DWORD old_protect = 0;
         if (VirtualProtect(reinterpret_cast<void*>(addresses[i]), 1, PAGE_EXECUTE_READWRITE, &old_protect)) {
