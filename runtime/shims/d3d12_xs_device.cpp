@@ -1128,12 +1128,14 @@ struct ListProxy {
     alignas(8) std::uint8_t console_fields[0x600];
     std::atomic<unsigned long> refs;    // past the console body
     unsigned pc_slot_count;             // slots the real list implements; mapped slots past it are refused
-    // LEONIDA_XS_LIST_REOPEN=1 (measurement, docs/render_loop.md): the frame loop records into lists it created and
-    // closed at startup and never resets, which on the console is legal (the allocator owns the recording memory) and
-    // on the PC runtime is not. The probe keeps the allocator the list was created with and resets the real list
-    // before the first recording call that reaches it while closed, so the recording is real instead of dropped.
+    // The console command-list lifecycle (docs/list_lifecycle.md): a console list's recording memory belongs to its
+    // allocator, so the title creates and closes its lists during setup and then records into them again every frame
+    // without a Reset. The PC runtime instead enforces the PC rule: a closed list accepts no recording and Close then
+    // fails. The proxy keeps the allocator the list was created with and, on a forwarded recording call that reaches
+    // the real list closed, resets it against that allocator first - what the console's allocator-owned recording
+    // memory does implicitly - so the frame's recording is real rather than dropped.
     ID3D12CommandAllocator* allocator;  // AddRef'd while the proxy lives
-    std::atomic<int> recording_state;   // 1: the real list is recording, 0: it was closed
+    std::atomic<int> recording_state;   // 1: the real list is recording, 0: its last Close succeeded
 
     void pin_cursor_at_limit() {
         const std::uint64_t at_limit = static_cast<std::uint64_t>(
@@ -1143,6 +1145,28 @@ struct ListProxy {
     }
 };
 static_assert(offsetof(ListProxy, console_fields) == 0x18, "the console fields start at +0x18");
+
+// The lifecycle emulation's logging: the first few reopens and their result, then silence (a reset per frame is normal
+// and must not fill the log). A failed Reset is reported once with the console call that needed it, and that call is
+// refused instead of being forwarded into a list the PC runtime would drop it from. Returns true when the reset
+// succeeded (the caller forwards the call), false when it did not (the caller refuses it with that HRESULT).
+bool note_list_reopen(ListProxy* self, unsigned console_slot, HRESULT reset) {
+    if (SUCCEEDED(reset)) {
+        static std::atomic<unsigned> reopened{0};
+        if (reopened.fetch_add(1, std::memory_order_relaxed) < 4)
+            std::fprintf(stderr, "[rt] d3d12_xs: reopened list %p for recording on console slot %u (allocator %p)\n",
+                         static_cast<void*>(self), console_slot, static_cast<void*>(self->allocator));
+        return true;
+    }
+    static std::atomic<bool> failed{false};
+    if (!failed.exchange(true, std::memory_order_relaxed))
+        std::fprintf(stderr,
+                     "[rt] d3d12_xs: could not reopen list %p for console slot %u: Reset 0x%08x (allocator %p); "
+                     "refusing the call\n",
+                     static_cast<void*>(self), console_slot, static_cast<unsigned>(reset),
+                     static_cast<void*>(self->allocator));
+    return false;
+}
 
 // The real object behind a heap, queue, fence or list proxy, or null when `object` is none of them.
 IUnknown* proxy_real_object(const void* object) {
@@ -1424,32 +1448,18 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
                                  static_cast<void*>(self),
                                  self->recording_state.load(std::memory_order_relaxed));
             }
-            // LEONIDA_XS_LIST_REOPEN=1: see ListProxy. A recording call that reaches a closed real list resets it
-            // against the allocator it was created with first, which is what the console's allocator-owned
-            // recording memory does implicitly. Every other forwarded slot behaves exactly as before when it is off.
-            static const bool reopen_closed = [] {
-                char value[8] = {};
-                return GetEnvironmentVariableA("LEONIDA_XS_LIST_REOPEN", value, sizeof(value)) > 0 &&
-                       value[0] != '\0' && value[0] != '0';
-            }();
-            if constexpr (Slot != 9 && Slot != 10) {
-                if (reopen_closed && self->allocator &&
-                    self->recording_state.load(std::memory_order_relaxed) == 0) {
+            // Console command-list lifecycle (docs/list_lifecycle.md): the title records every frame into lists it
+            // created and closed during setup. A forwarded recording call that reaches the real list closed resets it
+            // against the allocator it was created with first, which is what the console's allocator-owned recording
+            // memory does implicitly. PC recording starts at ClearState (slot 11): the slots before it (GetType,
+            // Close, Reset) append no commands, never reopen anything, and keep their exact previous behaviour.
+            if constexpr (pc >= 11) {
+                if (self->allocator && self->recording_state.load(std::memory_order_relaxed) == 0) {
                     using ResetFn = HRESULT(WINAPI*)(void*, ID3D12CommandAllocator*, ID3D12PipelineState*);
                     const HRESULT reset = reinterpret_cast<ResetFn>(real_vtable[10])(self->real, self->allocator,
                                                                                     nullptr);
-                    static std::atomic<unsigned> logged{0};
-                    const unsigned n = logged.fetch_add(1, std::memory_order_relaxed);
-                    if (SUCCEEDED(reset)) {
-                        self->recording_state.store(1, std::memory_order_relaxed);
-                        if (n < 4) std::fprintf(stderr, "[rt] d3d12_xs: reopened list %p for recording (allocator %p)\n",
-                                                static_cast<void*>(self), static_cast<void*>(self->allocator));
-                    } else if (n < 8) {
-                        std::fprintf(stderr,
-                                     "[rt] d3d12_xs: could not reopen list %p: Reset 0x%08x (allocator %p)\n",
-                                     static_cast<void*>(self), static_cast<unsigned>(reset),
-                                     static_cast<void*>(self->allocator));
-                    }
+                    if (!note_list_reopen(self, Slot, reset)) return hr_to_u64(reset);
+                    self->recording_state.store(1, std::memory_order_relaxed);
                 }
             }
             UnwrappedArray heaps;

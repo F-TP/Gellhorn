@@ -126,6 +126,15 @@ struct Mock {
     // Device slot 12 (CreateCommandList): the IID the PC method was asked for, by value. Slot 73 asks the host for the
     // base GraphicsCommandList interface and passes its own copy of the title's IID, so the pointer is not the title's.
     GUID list_iid;
+    // Command list: the real PC list's own lifecycle. The proxy tracks the recording state itself and reopens a
+    // closed list before a forwarded recording call (docs/list_lifecycle.md), so the mock models the two slots that
+    // define that state: Close (9) leaves the real list closed, Reset (10) reopens it and reports reset_result
+    // (E_FAIL injects the reopen failure path). list_events is the order the command-list slots were called in, to
+    // prove the Reset comes before the recording call it reopened for.
+    bool list_closed;
+    HRESULT reset_result;
+    unsigned list_events[kMockSlots];
+    unsigned list_event_count;
 };
 
 Mock g_pool[256];
@@ -263,6 +272,15 @@ std::uint64_t mock_call(Mock* m, unsigned slot, const std::uint64_t* words) {
     }
     if (m->kind == Kind::queue && slot == 10) copy_array(m, slot, a2, a1);  // ExecuteCommandLists(count, lists)
     if (m->kind == Kind::command_list && slot == 28) copy_array(m, slot, a2, a1);  // SetDescriptorHeaps(count, heaps)
+    if (m->kind == Kind::command_list && slot == 9) {  // Close: the PC list stops recording
+        m->list_closed = true;
+        return static_cast<std::uint32_t>(S_OK);
+    }
+    if (m->kind == Kind::command_list && slot == 10) {  // Reset(allocator, state): starts a recording, or reports
+        if (FAILED(m->reset_result)) return static_cast<std::uint32_t>(m->reset_result);
+        m->list_closed = false;
+        return static_cast<std::uint32_t>(S_OK);
+    }
     return S_OK;
 }
 
@@ -282,6 +300,8 @@ std::uint64_t WINAPI mock_slot(Mock* self, std::uint64_t a1, std::uint64_t a2, s
         // forwarding them as stack arguments let MSVC tail-call mock_call and write into the caller's saved
         // registers (an optimized build corrupted the test's own locals that way).
         ++self->calls[Slot];
+        if (self->kind == Kind::command_list && self->list_event_count < std::size(self->list_events))
+            self->list_events[self->list_event_count++] = Slot;
         const std::uint64_t words[] = {a1, a2, a3, a4, a5};
         std::memcpy(self->args[Slot], words, sizeof(words));
         return mock_call(self, Slot, words);
@@ -1316,6 +1336,65 @@ int check_console_command_list() {
     Mock* real_list = reinterpret_cast<Mock*>(xs::command_list_proxy_real_list(list_proxy));
     EXPECT(real_list != nullptr && real_list->kind == Kind::command_list);
 
+    // 3b. The console command-list lifecycle (docs/list_lifecycle.md): the title creates and closes its lists during
+    // setup and then records into them again every frame. On the console that is legal (the allocator owns the
+    // recording memory); the PC runtime would drop every recording call into a closed list. The proxy therefore
+    // resets the real list against the allocator it was created with before forwarding a recording call that reaches
+    // it closed. Console slot 85 (CopyTextureRegionX -> PC slot 16) is the recording call used here; it is a slot the
+    // rest of this check does not otherwise touch.
+    EXPECT(!real_list->list_closed);  // CreateCommandList leaves the real PC list recording
+    EXPECT(real_list->reset_result == S_OK);
+    EXPECT(real_list->calls[10] == 0 && real_list->calls[16] == 0);
+
+    // One Close leaves the real list closed; the next recording call gets exactly one Reset, against the real
+    // allocator (not the allocator proxy the title holds), and then the call itself.
+    EXPECT(hr_of(raw(list_proxy, 9, 0, 0, 0, 0)) == S_OK);
+    EXPECT(real_list->list_closed);
+    unsigned lifecycle_events = real_list->list_event_count;
+    raw(list_proxy, 85, 0x51, 0x52, 0x53, 0x54);
+    EXPECT(real_list->calls[10] == 1);
+    EXPECT(real_list->calls[16] == 1);
+    EXPECT(real_list->args[10][0] == word(real_allocator));
+    EXPECT(real_list->list_event_count == lifecycle_events + 2);
+    EXPECT(real_list->list_events[lifecycle_events] == 10);
+    EXPECT(real_list->list_events[lifecycle_events + 1] == 16);
+    EXPECT(!real_list->list_closed);
+
+    // A second Close and a second recording call trigger a second Reset (the per-frame case), and the list is open
+    // again afterwards.
+    EXPECT(hr_of(raw(list_proxy, 9, 0, 0, 0, 0)) == S_OK);
+    raw(list_proxy, 85, 0x61, 0, 0, 0);
+    EXPECT(real_list->calls[10] == 2);
+    EXPECT(real_list->calls[16] == 2);
+    EXPECT(!real_list->list_closed);
+
+    // A forwarded call before PC recording starts (GetType, PC slot 8) is not a recording call: it never reopens a
+    // closed list and no Reset happens.
+    EXPECT(hr_of(raw(list_proxy, 9, 0, 0, 0, 0)) == S_OK);
+    const unsigned resets_after_close = real_list->calls[10];
+    raw(list_proxy, 8, 0, 0, 0, 0);
+    EXPECT(real_list->calls[8] == 1);
+    EXPECT(real_list->calls[10] == resets_after_close);
+    EXPECT(real_list->list_closed);
+
+    // A failed Reset is reported (E_FAIL with the call that needed it) and the recording call is refused, not
+    // forwarded: the real list stays closed and untouched and the caller gets the Reset's HRESULT.
+    real_list->reset_result = E_FAIL;
+    const unsigned events_before_failure = real_list->list_event_count;
+    EXPECT(hr_of(raw(list_proxy, 85, 0x71, 0, 0, 0)) == E_FAIL);
+    EXPECT(real_list->calls[10] == resets_after_close + 1);
+    EXPECT(real_list->calls[16] == 2);
+    EXPECT(real_list->list_closed);
+    EXPECT(real_list->list_event_count == events_before_failure + 1);
+    EXPECT(real_list->list_events[events_before_failure] == 10);
+
+    // Once Reset reports success again, a later recording call reopens normally and is forwarded.
+    real_list->reset_result = S_OK;
+    raw(list_proxy, 85, 0x81, 0, 0, 0);
+    EXPECT(real_list->calls[10] == resets_after_close + 2);
+    EXPECT(real_list->calls[16] == 3);
+    EXPECT(!real_list->list_closed);
+
     // Console slot 32 (SetDescriptorHeaps) -> PC slot 28
     // Pass descriptor heap proxy to ensure UnwrappedArray unwrap_object works
     D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 16, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
@@ -1361,8 +1440,9 @@ int check_console_command_list() {
     // Console slot 10 (Reset) unwraps allocator proxy and re-pins inline cursor
     std::uint64_t zero = 0;
     std::memcpy(reinterpret_cast<void*>(base + 0x18), &zero, sizeof(zero));
+    const unsigned resets_before_explicit = real_list->calls[10];
     EXPECT(hr_of(raw(list_proxy, 10, word(allocator), 0, 0, 0)) == S_OK);
-    EXPECT(real_list->calls[10] == 1);
+    EXPECT(real_list->calls[10] == resets_before_explicit + 1);
     EXPECT(real_list->args[10][0] == word(real_allocator));
     std::memcpy(&c18, reinterpret_cast<const void*>(base + 0x18), sizeof(c18));
     EXPECT(c18 == expected_limit);
@@ -1424,7 +1504,8 @@ int check_console_command_list() {
     EXPECT(xs::list_slot_hits(32) == 0);
     EXPECT(!xs::list_slot_first_call_seen(32));
 
-    std::printf("%s: console command list routing, cursor pinning, queue unwrapping, and slot mapping passed\n", g_label);
+    std::printf("%s: console command list routing, lifecycle, cursor pinning, queue unwrapping, and slot mapping "
+                "passed\n", g_label);
     return 0;
 }
 
