@@ -282,6 +282,28 @@ int wmain(int argc, wchar_t** argv) {
             }
             std::fflush(stdout);
         }
+        // LEONIDA_SEED_GLOBAL=<rva>:<size> allocates a zeroed block and points a mapped image's 8-byte global at it
+        // before the title's entry point runs. Diagnostic for a global whose initialiser exists but is never reached on
+        // this run: it separates "the producer never runs" from "the consumer is wrong". Prints what it did.
+        if (const DWORD size = GetEnvironmentVariableW(L"LEONIDA_SEED_GLOBAL", nullptr, 0); size > 1) {
+            std::wstring value(size, L'\0');
+            const DWORD n = GetEnvironmentVariableW(L"LEONIDA_SEED_GLOBAL", value.data(), size);
+            if (n > 0 && n < size) value.resize(n);
+            const std::wstring spec(value);
+            const auto colon = spec.find(L':');
+            const auto rva = std::wcstoull(spec.substr(0, colon).c_str(), nullptr, 16);
+            const auto bytes = colon == std::wstring::npos ? 0x1000u
+                                                           : static_cast<std::size_t>(
+                                                                 std::wcstoull(spec.substr(colon + 1).c_str(), nullptr, 16));
+            if (void* block = VirtualAlloc(nullptr, bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE)) {
+                *reinterpret_cast<void**>(main_module.base + rva) = block;
+                std::fprintf(stderr, "[rt] seeded image+0x%llx with %zu zeroed bytes at %p (stand-in)\n",
+                             static_cast<unsigned long long>(rva), bytes, block);
+            } else {
+                std::fprintf(stderr, "[rt] could not seed image+0x%llx (error %lu)\n",
+                             static_cast<unsigned long long>(rva), GetLastError());
+            }
+        }
         std::printf("running %s\n", main_module.name.c_str());
         std::fflush(stdout);
         // LEONIDA_WATCH_GLOBAL=<hex rva> logs every change of a mapped image's 8-byte global with the millisecond it
