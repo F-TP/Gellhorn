@@ -266,3 +266,26 @@ Two things this settles:
   title still arrives at the same null object (`game+0xCC2861`, reading `0x10`) instead of anything downstream.
 
 BCPack and swizzle requests are still refused explicitly; the log names the modes and size bands when they are asked for.
+
+## The eleven "missing" programs were a decompression failure
+
+For several rounds the boot was described as needing translations for eleven pipeline programs that matched no extracted
+library record. That was an artifact. The DirectStorage shim refused a request's zlib stage, and the library bytes the
+title handed to the device for those records were therefore zero pages. Dumping them captured the zeros, which is why
+they matched nothing, why same-size library records differed in hundreds of bytes, and why a raw search of the package
+found nothing.
+
+With the zlib stage implemented, the same boot reports:
+
+```
+d3d12 calls: 11,894
+pipeline failures: 0 of 42
+programs dumped as untranslated: 0
+```
+
+and that is **without the stand-in pipeline path at all**. Every compute pipeline the title asks for resolves to a
+translated library program. The stand-in remains available as a diagnostic but is no longer needed to get this far.
+
+The lesson worth keeping: a refused decompression did not fail loudly at the point of use. It produced valid-looking
+zeros downstream, and three separate investigations spent rounds on "missing programs" that did not exist. When a shim
+refuses a *data* stage, the bytes it feeds every later consumer are wrong, and nothing downstream can tell.
