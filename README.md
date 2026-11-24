@@ -40,16 +40,17 @@ clean-room approach, plus the boot fixes measured on this machine.
 | Refused graphics pipeline creations (console slot 57, before the conversion) | 10,242 |
 | Slot-57 calls per boot (deserialized graphics records) | 10,242 |
 | Distinct graphics programs behind them | 1,264 (945 PS, 319 VS) |
-| Graphics stand-in pipeline states handed out in the measurement | 10,241 |
 | Stand-in effect on the stop | none (same instruction, same null) |
+| Highest traced D3D12 call (after the A8 fix) | 12,085 |
+| A8 render-target formats refused | 0 (was 1 per factory call) |
 
-**Where it stops now:** `game+0xcc2861` - a read at 0x10 because a small container element is null. Measured, that is NOT the graphics pipelines the title asks for: with 10,241 stand-in pipeline states handed over (LEONIDA_STANDIN_PIPELINES), the boot stops at the same instruction with the same null and the same call count. The next question is what should populate that container element.
+**Where it stops now:** `game+0x4fb0aec` - a call through a garbage vtable: the object holds 0x3b9aca00 (10^9) where its vtable pointer belongs, and the call target computes to 0x3b9aca60. This is past the A8 render-target fix, which moved the boot from game+0xcc2861 and raised the traced-call count from 11,986 to 12,085. Next: find who wrote a value that looks like a size into the object's first qword.
 Measurements and the method behind them: [docs/boot_frontier.md](docs/boot_frontier.md).
 
 Next up:
-- find what populates the null container element (class vtable image+0x6597C60, constructor game+0x1B37440)
-- convert slot-57 records into real pipelines for rendering - needed, but measured not to be the boot blocker
-- fix the shader stage's two-shader completeness gate and the quadratic llvm-mc listings in the pipeline-library step
+- find the writer of the 10^9 value in the object's vtable slot at game+0x4fb0aec
+- convert slot-57 records into real pipelines for rendering (needed, measured not to be the boot blocker)
+- fix the shader stage's two-shader completeness gate and the quadratic llvm-mc listings
 
 More: [the full measurement ladder](docs/boot_frontier.md), [the null-object chain trace](docs/null_object_chain.md), [how the other public attempt is built](docs/competitor_intel.md), [incoming reports and tracked findings](docs/issues.md).
 

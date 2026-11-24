@@ -482,3 +482,37 @@ same instruction with the same null. The conversion is still needed for renderin
 records), but it is not the next boot blocker. The next question is what should have populated the container element that
 the faulting code reads - the object built by the class whose vtable is `image+0x6597C60` and whose constructor is
 `game+0x1B37440`.
+
+
+## Frontier 2026-11-24 (A8 render targets: the stop moved, and a garbage vtable is next)
+
+The null container element was traced to a texture the title's own factory creates: a 3840x2160, 1-sample, A8_UNORM
+**render target** (measured from the descriptor handed to the factory and the flag word that sets ALLOW_RENDER_TARGET).
+The PC format gate refused A8 with the render-target flag, so console slot 108's allocation query returned the D3D12
+invalid answer (SizeInBytes = UINT64_MAX), which the slot-108 bridge counted as a real answer instead of using its 64 KiB
+fallback; the factory's finalize then returned null, and the title asserted its way through its own int3 traps
+(game+0xABFE1B, then game+0xCC2936) into the crash at game+0xcc2861.
+
+Fix, in two parts:
+
+* A8_UNORM is accepted for a 2D, single-sample colour image and, with ALLOW_RENDER_TARGET, exposed as R8_UNORM with the
+  colour-attachment usage (the A8 view path already moves the bits into alpha). CheckFeatureSupport reports
+  RENDER_TARGET for A8 when the host can attach R8_UNORM.
+* The slot-108 bridge treats SizeInBytes == UINT64_MAX as "cannot size" and uses its fallback, so an unsupported
+  description can never publish an invalid allocation again.
+
+Measured after the fix: the "format not supported yet: 65" line is gone, the stop moves from game+0xcc2861 to
+**game+0x4fb0aec**, and the highest traced D3D12 call rises from 11,986 to **12,085**.
+
+### The new stop
+
+`game+0x4fb0aec` is `call qword ptr [rax + 0x60]`: rax comes from `mov rax, qword ptr [rcx]`, and the read that faults is
+at 0x3b9aca60, so the object in rcx has **0x3b9aca00 (10^9) as its first qword** where a vtable pointer belongs. rcx
+itself is a plausible heap address (registers captured with LEONIDA_DUMP_REGS). The call is reached from the small glue
+wrapper game+0x4fb0a90 (which passes a two-word callback struct holding the pointer to game+0x10a330) and its caller is
+game+0x23cf363.
+
+10^9 in a pointer slot is not a wild read: it is a value that was written there, most plausibly a size (one gibibyte) or
+a sentinel that a structure layout put at offset 0. The next step is to find the writer: either our shim wrote a 64-bit
+size where the title's object expects a vtable pointer (a layout mismatch in an answered call), or the title stored a
+sentinel that a class slot is expected to test before calling.
