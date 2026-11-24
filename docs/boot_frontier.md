@@ -625,3 +625,26 @@ unlock the renderer: the frame's recording is still being dropped because its co
 So the order is: command-list lifecycle first (make the recording survive; the closed list is why no draw is ever
 recorded), then the console barrier conversion at list slot 146, then the real present wiring - and the null plane
 resource is a fourth thread worth pulling while the lifecycle work happens.
+
+
+## Frontier 2026-11-24 (the frame's recording works; two console recording calls are invalid)
+
+The list proxy now emulates the console's lifecycle (docs/list_lifecycle.md): it remembers the allocator a list was
+created against and whether the real PC list is recording, and when a recording call reaches a closed list it resets the
+real list against that allocator first (PC `Reset(allocator, nullptr)`), forwarding only on success. A successful Close
+marks it closed, so the next frame's first recording call reopens it. Failures log once with the HRESULT and refuse
+rather than forwarding.
+
+Measured, two runs at the same tree: default behaviour still shows 625 successful closes and 104,340 failed ones, because
+two console recording calls make the PC runtime mark the list invalid: **list slot 146** (a resource-less 64-byte texture
+barrier group the PC runtime rejects with E_INVALIDARG - docs/render_loop.md) and **list slot 52**, which forwards to PC
+`ClearRenderTargetView` and returns false because the console CPU handle and the PC target-view capture disagree. With
+those two calls muted (`LEONIDA_XS_LIST_MUTE=146,52`, a measurement switch) the lifecycle runs every frame: **57,597 Close
+S_OK, 0 failed, 56,915 reopens, 56,983 submits, ALIVE**, and the mock test covers reopen-on-recording, Close, GetType
+never reopening, and a failed Reset refusing.
+
+So the recording path is solved in principle; the next two pieces are the real conversions behind those two mutes:
+console `ClearRenderTargetView` (slot 52) must map the console CPU descriptor handle onto the PC target view the capture
+expects, and the console barrier (slot 146) must translate its 64-byte texture group (which can carry `pResource = 0`)
+into the PC barrier the runtime accepts. No draw is recorded yet either way, which is expected: the graphics pipeline
+records (device slot 57) are still refused, so the renderer has no pipeline state to draw with.
