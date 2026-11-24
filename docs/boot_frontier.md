@@ -341,3 +341,21 @@ address resolve to the resource's host memory. The descriptor-heap work already 
 
 Cross-reference: the public attempt (VIctory) does not need this, because it runs the title on host D3D12 where the
 console's GPU virtual addresses are the host's own resource addresses.
+
+
+## Frontier 2026-11-24 (later): queue slot 18 returned a struct the wrong way round
+
+The stop at `game+0x2484133` (a read of `0x100000000`, a clobbered `rbx`) was localised with the new crash report and
+register-log pokes: `rbx` is correct at `game+0x2484129`, and wrong at `game+0x248412E`, so the faulting frame's first
+D3D12 call - queue slot 18, `GetDesc` - was the cause. The path reaches it by a `js` at `game+0x24840E3`, which is why
+earlier probes on the fall-through instructions never fired.
+
+Slot 18 was the audit's unmeasured convention: the title calls it as `(queue, buffer)`, and our queue is a C++ object
+whose `GetDesc` returns `D3D12_COMMAND_QUEUE_DESC` by value, so MSVC wants the hidden return pointer in RCX and the object
+in RDX. The generic forwarder passed them the other way round, so the descriptor was written into the front of the real
+queue object and the title's buffer kept its previous contents; the title read `1 << 32` out of it and dereferenced that.
+
+Measured after the fix: the stop moves to `game+0xcc2861` (a read of `0x10`) and the D3D12 call count rises from 11,906
+to 11,986. Slot 18 now has its own conversion beside the device proxy's struct-return cases.
+
+The next stop is a null-ish read in frame `image+0xcc2861`, whose caller is `image+0x186324`.

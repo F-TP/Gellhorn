@@ -688,6 +688,7 @@ enum class ChildKind { queue, fence, allocator };
 constexpr unsigned kQueueSlots = 128;        // the table: 19 public slots plus a refused tail
 constexpr unsigned kFenceSlots = 64;         // the table: 12 public slots plus a refused tail
 constexpr unsigned kQueuePublicSlots = 19;   // ID3D12CommandQueue
+constexpr unsigned kQueueGetDesc = 18;           // the one queue method that returns a struct by value
 constexpr unsigned kFencePublicSlots = 11;   // ID3D12Fence
 constexpr unsigned kFence1PublicSlots = 12;  // ID3D12Fence1
 constexpr unsigned kAllocatorSlots = 64;     // the table: 9 public slots plus a refused tail
@@ -1239,6 +1240,18 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
         d3d12_trace::record(child_trace_name<K>(Slot));
         return hr_to_u64(child_get_device<K>(self, reinterpret_cast<const IID*>(a1),
                                              reinterpret_cast<void**>(a2)));
+    } else if constexpr (K == ChildKind::queue && Slot == kQueueGetDesc) {
+        // The title calls this as (this, buffer): the queue object in RCX and the D3D12_COMMAND_QUEUE_DESC it wants in
+        // RDX. Our queue is a C++ object whose GetDesc returns that struct by value, so MSVC wants the hidden return
+        // pointer in RCX and the object in RDX - the opposite order. Forwarded through the generic path, the descriptor
+        // was written into the front of the real queue object and the title's buffer kept whatever it held, which the
+        // title then read as live values (measured: a clobbered callee-saved register and a fault on 0x100000000).
+        note_child_slot<K>(Slot);
+        d3d12_trace::record(child_trace_name<K>(Slot));
+        using GetDescFn = void(WINAPI*)(void*, void*);
+        auto* const method = reinterpret_cast<GetDescFn>(self->real_vtable[Slot]);
+        method(reinterpret_cast<void*>(a1), self->real);
+        return 0;
     } else if constexpr (K == ChildKind::queue && Slot == 35) {
         // A console queue extension past the PC table. Measured from the title's call sites: it is called as
         // (this, arg, pair*) and the caller reads two 64-bit values back from the second argument, so leaving them
