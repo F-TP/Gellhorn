@@ -2112,12 +2112,16 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
         // once so the real shape decides the wiring instead of the public layouts alone. LEONIDA_PRESENT_STUB=1 answers
         // S_OK without presenting - a measurement of whether present success changes the title's loop, never a fix.
         note_child_slot<K>(Slot);
-        static std::atomic<bool> dumped{false};
-        if (!dumped.exchange(true, std::memory_order_relaxed)) {
+        static std::atomic<std::uint64_t> presents{0};
+        const std::uint64_t present_number = presents.fetch_add(1, std::memory_order_relaxed) + 1;
+        // Sampled, not one-shot: whether the plane ever carries a real resource decides the next thread.
+        const bool sampled = present_number <= 2 || present_number == 1000 || present_number == 10000 ||
+                             present_number == 100000 || present_number == 1000000;
+        if (sampled) {
             std::fprintf(stderr,
-                         "[rt] d3d12_xs: PresentX probe: planes %llu at %p, params %p\n",
-                         static_cast<unsigned long long>(a1), reinterpret_cast<void*>(a2),
-                         reinterpret_cast<void*>(a3));
+                         "[rt] d3d12_xs: PresentX call %llu: planes %llu at %p, params %p\n",
+                         static_cast<unsigned long long>(present_number), static_cast<unsigned long long>(a1),
+                         reinterpret_cast<void*>(a2), reinterpret_cast<void*>(a3));
             MEMORY_BASIC_INFORMATION mbi{};
             const bool readable = a2 && VirtualQuery(reinterpret_cast<const void*>(a2), &mbi, sizeof(mbi)) ==
                                                sizeof(mbi) &&
@@ -2130,7 +2134,9 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
                 std::memcpy(&resource_count, plane_bytes + 0x08, sizeof(resource_count));
                 std::memcpy(&resources, plane_bytes + 0x10, sizeof(resources));
                 std::fprintf(stderr,
-                             "[rt]   plane 0: token 0x%llx resources %u at %p, colour space %d scale filter %d flags 0x%x\n",
+                             "[rt]   plane 0 (call %llu): token 0x%llx resources %u at %p, colour space %d scale "
+                             "filter %d flags 0x%x\n",
+                             static_cast<unsigned long long>(present_number),
                              static_cast<unsigned long long>(plane_words[0]), resource_count,
                              reinterpret_cast<void*>(resources),
                              *reinterpret_cast<const int*>(plane_bytes + 0x28),
@@ -2142,7 +2148,8 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
                                      sizeof(list_mbi) &&
                     list_mbi.State == MEM_COMMIT && !(list_mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD));
                 if (list_readable && resource_count)
-                    std::fprintf(stderr, "[rt]   plane 0 resource 0: %p\n",
+                    std::fprintf(stderr, "[rt]   plane 0 resource 0 (call %llu): %p\n",
+                                 static_cast<unsigned long long>(present_number),
                                  reinterpret_cast<void*>(reinterpret_cast<const std::uint64_t*>(resources)[0]));
             }
         }
@@ -2883,7 +2890,8 @@ void note_slot57(Slot57Call& call) {
                              "+0x4C = %u, printable runs [%s]\n",
                              call.layout_bytes, call.layout_count, call.layout_runs.c_str());
                 if (slot57_layout_dump() && call.layout_data) {
-                    const std::size_t shown = std::min<std::size_t>(call.layout_bytes, 176);
+                    const std::size_t shown =
+                        std::min<std::size_t>(call.layout_bytes, rt::graphics_record::kInputLayoutMaxBytes);
                     std::fprintf(stderr, "[rt] d3d12_xs: slot 57 layout dump (%zu B, count %u):", call.layout_bytes,
                                  call.layout_count);
                     for (std::size_t i = 0; i < shown; ++i) {
