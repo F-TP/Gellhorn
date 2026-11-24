@@ -385,8 +385,8 @@ int wmain(int argc, wchar_t** argv) {
                         VirtualProtect(at, 1, old, &old);
                         addresses[count] = reinterpret_cast<std::uintptr_t>(at);
                         ++count;
-                        std::printf("[rt] poked a register log at image+0x%llx\n",
-                                    static_cast<unsigned long long>(rva));
+                        std::printf("[rt] poked a register log at image+0x%llx (byte now %02x, was %02x)\n",
+                                    static_cast<unsigned long long>(rva), *at, originals[count ? count - 1 : 0]);
                     }
                 }
                 if (comma == std::wstring::npos) break;

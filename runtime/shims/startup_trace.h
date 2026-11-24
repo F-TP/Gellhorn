@@ -333,6 +333,26 @@ inline bool skip_int3(EXCEPTION_POINTERS* info) {
                      reinterpret_cast<void*>(c.Rdx), reinterpret_cast<void*>(c.R8), reinterpret_cast<void*>(c.R9),
                      reinterpret_cast<void*>(c.Rdi), reinterpret_cast<void*>(c.Rsi),
                      reinterpret_cast<void*>(c.R12));
+        // The call chain, as raw words, in one atomic write so another thread's logging cannot split it.
+        {
+            char line[320];
+            int used = std::snprintf(line, sizeof(line), "[rt] poke stack:");
+            const auto stack = static_cast<std::uintptr_t>(c.Rsp);
+            MEMORY_BASIC_INFORMATION mbi{};
+            if (used > 0 && VirtualQuery(reinterpret_cast<const void*>(stack), &mbi, sizeof(mbi)) == sizeof(mbi) &&
+                mbi.State == MEM_COMMIT && !(mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD))) {
+                const auto* words = reinterpret_cast<const std::uint64_t*>(stack);
+                for (int w = 0; w < 8 && used > 0 && used < static_cast<int>(sizeof(line)) - 32; ++w)
+                    used += std::snprintf(line + used, sizeof(line) - used, " %llx",
+                                          static_cast<unsigned long long>(words[w]));
+            }
+            if (used > 0 && used < static_cast<int>(sizeof(line)) - 2) {
+                line[used++] = '\n';
+                line[used] = '\0';
+                std::fwrite(line, 1, static_cast<size_t>(used), stderr);
+                std::fflush(stderr);
+            }
+        }
         auto* const originals = poke_log_originals();
         DWORD old_protect = 0;
         if (VirtualProtect(reinterpret_cast<void*>(addresses[i]), 1, PAGE_EXECUTE_READWRITE, &old_protect)) {
