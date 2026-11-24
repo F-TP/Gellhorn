@@ -1,6 +1,6 @@
 # The slot-57 graphics PSO backend: native stages and the record builder
 
-**Status: backend, not wired.** This is the conversion layer for the console's deserialized graphics pipeline record
+**Status: wired.** The proxy calls this at device slot 57 (docs/slot57_wiring.md); measured on a 150 s boot, 1,074 records build into real PC graphics pipelines and 8,926 refuse at the input-layout blob because its element table is not decoded yet. This is the conversion layer for the console's deserialized graphics pipeline record
 (device slot 57): `runtime/src/graphics_record.{h,cpp}` decodes the record (docs/graphics_record.md), and this layer turns
 it into the two things the PC side needs - a library entry for each native stage (`PipelineState::create_graphics`'s
 native branch) and a `D3D12_GRAPHICS_PIPELINE_STATE_DESC` for the record (`rt::graphics_pso::build`). Nothing here calls
