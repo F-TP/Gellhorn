@@ -39,16 +39,17 @@ clean-room approach, plus the boot fixes measured on this machine.
 | FidelityFX pipeline programs translated | 29 / 29 |
 | Refused graphics pipeline creations (console slot 57, before the conversion) | 10,242 |
 | Slot-57 calls per boot (deserialized graphics records) | 10,242 |
-| Distinct slot-57 records a boot asks for | 9,943 |
 | Distinct graphics programs behind them | 1,264 (945 PS, 319 VS) |
+| Graphics stand-in pipeline states handed out in the measurement | 10,241 |
+| Stand-in effect on the stop | none (same instruction, same null) |
 
-**Where it stops now:** `game+0xcc2861` - a read at 0x10 because a small container element is null, and the null traces to pipeline states the title never received: console device slot 57 is a deserialized graphics pipeline record (measured - root signature, fixed-function state blob, input-layout blob, then native program and kind-2 stage-blob pairs in record order), whose programs hash-match the pipeline library already extracted. What is missing is a graphics-side resolver and the library's graphics programs in the shader index.
+**Where it stops now:** `game+0xcc2861` - a read at 0x10 because a small container element is null. Measured, that is NOT the graphics pipelines the title asks for: with 10,241 stand-in pipeline states handed over (LEONIDA_STANDIN_PIPELINES), the boot stops at the same instruction with the same null and the same call count. The next question is what should populate that container element.
 Measurements and the method behind them: [docs/boot_frontier.md](docs/boot_frontier.md).
 
 Next up:
-- test a graphics PSO stand-in behind LEONIDA_STANDIN_PIPELINES: does the title get past the null container, or does it need real pipelines? (XCL builds pipelines non-blockingly and hands out stand-ins at once)
-- publish the pipeline library's graphics programs into the shader index (61 of its entries are in it today, all compute)
-- add a native-program branch to the graphics stage loop and decode the record's state and input-layout blobs
+- find what populates the null container element (class vtable image+0x6597C60, constructor game+0x1B37440)
+- convert slot-57 records into real pipelines for rendering - needed, but measured not to be the boot blocker
+- fix the shader stage's two-shader completeness gate and the quadratic llvm-mc listings in the pipeline-library step
 
 More: [the full measurement ladder](docs/boot_frontier.md), [the null-object chain trace](docs/null_object_chain.md), [how the other public attempt is built](docs/competitor_intel.md), [incoming reports and tracked findings](docs/issues.md).
 

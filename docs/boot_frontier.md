@@ -443,3 +443,42 @@ publishing the programs is a bounded task - roughly the size of the compute set 
 The state blob is undecoded and is the main unknown; the input-layout blob is partially decoded (element count at +0x4C,
 NUL-terminated semantics inline, 28 attribute bytes per element beginning with a format-sized code at +0x10). The
 measurements come from a reassembled library held outside the repository; nothing here quotes game data.
+
+
+## Frontier 2026-11-24 (the corpus was rebuilt; the missing pipelines are not the blocker)
+
+Publishing the graphics programs triggered the shader stage's own fingerprint check: a commit of ours had changed a
+translator source, so `make_game --stages shaders` deleted the root index and started a full retranslation. That run was
+interrupted at 93% (an agent turn ended, and its background job with it), which left the work folder with no
+`shaders/spirv/index.json` and every boot failing early with a host C++ exception. Recovery, in order: rerun the one
+shard that crashed (shard 6, 0xC0000005; 1,657/1,657 translated, all `spirv-val` clean), merge the 16 parts (26,501
+entries), then run the post-translation stages (fspx 29/29, bvh 52/52, graphics 1,266/1,266) and republish the 42
+pipeline-library compute programs. Final loaded set: 26,501 + 1,337 + 52 = 27,890 entries, and the boot is back to the
+baseline stop with 0 pipeline failures.
+
+Two findings from it worth keeping:
+
+* The current translator refuses two duplicate-name variants that the old corpus contained, so the completeness gate at
+  the end of the shader stage blocks the designed `--stages shaders` path. The stages had to be run individually.
+* The pipeline-library sub-step is pathological on this machine: `shader_library.py --stages cs --disasm` wrote 9.4 GB of
+  listings in 17 minutes and reached 841 of 2,684 programs. The library's compute programs contain many invalid vcc-tuple
+  words, and `llvm-mc` prints the whole input hex line in a warning comment for each one, so a 120 KB program becomes a
+  100-134 MB listing (one file reached 137 MB). The main corpus (26,503 programs) disassembles in about 15 minutes, so the
+  library class is abnormal; the listing pass and the translation pass that reads those listings both pay for it.
+
+### The stand-in measurement: missing pipeline states are not the current blocker
+
+With `LEONIDA_STANDIN_PIPELINES=1`, console device slot 57 hands the title a real `ID3D12PipelineState` built from a
+project-owned trivial VS+PS pair, once per refusable record, logged every time. Measured:
+
+| | stand-in off | stand-in on |
+|---|---|---|
+| stand-ins handed out | 0 | **10,241** |
+| highest traced call | 11,986 | 11,986 |
+| stop | `game+0xcc2861` (read at 0x10) | **`game+0xcc2861` (read at 0x10)** |
+
+So the title's null container is not waiting for the graphics pipelines it asked for: it gets them and still stops at the
+same instruction with the same null. The conversion is still needed for rendering (and for any draw that binds those
+records), but it is not the next boot blocker. The next question is what should have populated the container element that
+the faulting code reads - the object built by the class whose vtable is `image+0x6597C60` and whose constructor is
+`game+0x1B37440`.
