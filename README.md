@@ -22,38 +22,37 @@ clean-room approach, plus the boot fixes measured on this machine.
 | Stage | State | What backs that |
 |---|---|---|
 | Image and platform | **done** | the title's PE32+ image maps at its preferred base, imports resolve through shims, static TLS is redirected for 53,246 slot-0 reads, heap and file system come from the host |
-| Shader corpus | **done** | 26,616 SPIR-V modules indexed; the pipeline library and FPSX repair are part of the build, and the boot loads 27,890 translated entries with 0 pipeline failures |
-| Console D3D12 on Vulkan | **done** | device, queues, fences, allocators, descriptor heaps, command lists and pipelines answer; the console queue's two-method slot shift, the A8 render-target format and the fence completed-value address are measured and mapped |
+| Shader corpus | **done** | 26,616 SPIR-V modules indexed; the boot loads 27,890 translated entries with 0 pipeline failures |
+| Console D3D12 on Vulkan | **done** | device, queues, fences, allocators, descriptor heaps and command lists answer; the console queue's two-method slot shift, the fence completed-value address, the command-list lifecycle and the clear/barrier conversions are measured and mapped |
 | Console DirectStorage | **done** | factory, file open, zlib decompression; BCPack and swizzled reads still refuse rather than guess |
-| Boot chain | **done** | the title boots and runs its own loop for at least 400 s with no exception (5.2M traced D3D12 calls in 300 s), after the fence slot 12 answer |
-| World rendering | not reached | nothing is executed on the GPU yet, so nothing can be drawn |
-| Frame loop | in progress | 78,745 frame submits succeed per 140 s run (ExecuteCommandLists ok after the console queue slot 35 submit was wired and monitorx/mwaitx were emulated), but each frame's lists are already closed, so its recording is discarded and no draw is ever recorded |
-| Presentation | in progress | console PresentX (queue slot 32) is called once per frame and still refuses with E_NOTIMPL - the frontier |
+| Boot chain | **done** | the title boots and runs its own loop for the full timeout with no exception |
+| Frame loop | **done** | the frame records, closes and submits: 88,128 Close calls succeed with 0 failed, ~43,750 frames submitted per 150 s run, console queue slot 35 is wired as the submit |
+| Pipeline construction | **done** | all 10,241 slot-57 graphics records build into real PC pipelines (0 refusals) after the input-layout element table was decoded; fixed-function state and attachments are still documented stand-ins |
+| Draw recording | **done** | 42,721 SetPipelineState and 42,722 DrawInstanced recorded per 150 s boot |
+| Draw execution | in progress | every draw-carrying submit is refused on an unrebased title VA; registering the placed-buffer stand-in under its console VA makes the draws execute and TDRs the GPU, because translated shaders compute host_address = heap_base + console_va (docs/replay_resolution.md) |
+| Presentation | in progress | the title writes a null resource into its own display-surface record every frame, so present calls name nothing; the presentation core is prepared for wiring (docs/display_path.md) |
+| World rendering | not reached | no draw-carrying submit executes yet, so nothing can be drawn |
 
 | Measured | Value |
 |---|---|
-| D3D12 calls in a retail boot | 11,986 |
-| Pipeline creation failures | 0 |
-| Carved game shader modules | 26,503 |
-| SPIR-V modules indexed | 26,616 |
-| FidelityFX pipeline programs translated | 29 / 29 |
-| Refused graphics pipeline creations (console slot 57, before the conversion) | 10,242 |
-| Slot-57 calls per boot (deserialized graphics records) | 10,242 |
-| Distinct graphics programs behind them | 1,264 (945 PS, 319 VS) |
-| Stand-in effect on the stop | none (same instruction, same null) |
-| A8 render-target formats refused | 0 (was 1 per factory call) |
-| Retail boot result | ALIVE; frames submitted, none presented |
-| Frame recording (converted, no mutes, 60 s) | 30,999 closes OK / 0 failed, 30,376 submits |
-| Graphics PSO backend tests | 128 checks |
+| Retail boot result | ALIVE the full timeout, no exception |
+| Graphics pipelines built from slot-57 records | 10,241 of 10,241 (0 refusals) |
+| Draws recorded per 150 s run | 42,722 DrawInstanced / 42,721 SetPipelineState |
+| Frame submits per 150 s run | 43,755 ok / 43,750 refused (one per draw) |
+| Close calls per 150 s run | 88,128 ok / 0 failed |
+| Translated shader entries loaded | 27,890 |
+| Draw-execution measurement | draws execute with the console-VA registration, then GPU TDR |
 
-**Where it stops now:** `none - the title runs and submits frames (ALIVE, 78,745 submits per 140 s)` - the frame's recording is now fully honest: no mutes, 30,999 successful closes, 30,376 recorded frames submitted, barriers and the null-target clear converted (docs/handles_barriers.md). The draw path is the frontier: no draw or pipeline state is ever recorded because the frame clears a null render target, and the slot-57 pipeline records - for which the backend now exists (docs/graphics_pso.md) - are not wired yet and would refuse input layouts with elements until their format codes are decoded.
-Measurements and the method behind them: [docs/boot_frontier.md](docs/boot_frontier.md).
+**Where it stops now:** `none - the title runs, records and submits; every draw-carrying submit is refused on an unrebased title VA` - the title boots, runs, records frames, builds all 10,241 graphics pipelines and records 42,722 draws per 150 s run. The open frontier is the GPU address space: draws bind vertex buffers by the title's two-terabyte page VAs, and making one execute (by registering the placed-buffer stand-in under its console VA) TDRs the GPU because translated shaders compute host_address = heap_base + console_va - the page VAs must be put into the single GPU address space. Presentation is separately blocked on the title writing a null display surface.
+Measurements and the method behind them: [docs/replay_resolution.md](docs/replay_resolution.md).
 
 Next up:
-- wire slot-57 records through the new graphics_pso backend and measure which field refuses the most records
-- decode the input-layout format codes (the builder refuses any layout with elements today)
-- find why the frame's render-target view is null - what should create the real target
-- wire PresentX for real once the frame has content
+- put the title's page VAs into the GPU address space (arena range at creation + VA rebasing) so a draw executes without a TDR
+- import the title's placed pages (their writes are not visible to the GPU today)
+- name the creator of the null display surfaces and give them a real resource
+- fix console device slot 55 (forwarded to PC CreateReservedResource1; 41,545 failures per 120 s)
+- decode the slot-57 fixed-function state blob (rasterizer/blend/depth/topology/sample and attachments are stand-ins)
+- wire PresentX once the present names a real resource
 
 More: [the full measurement ladder](docs/boot_frontier.md), [the null-object chain trace](docs/null_object_chain.md), [how the other public attempt is built](docs/competitor_intel.md), [incoming reports and tracked findings](docs/issues.md).
 
