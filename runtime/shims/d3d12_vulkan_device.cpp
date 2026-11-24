@@ -954,11 +954,21 @@ struct DeviceState {
     // The format a texture description is created with, D24S8 and R9G9B9E5 UAV fallbacks included.
     Format texture_format(const D3D12_RESOURCE_DESC& desc) const {
         if (!xr_bias_compatible(desc)) return {};
-        if (desc.Format == DXGI_FORMAT_A8_UNORM &&
-            (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.SampleDesc.Count != 1 ||
-             (desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL |
-                            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))))
-            return {};
+        if (desc.Format == DXGI_FORMAT_A8_UNORM) {
+            // Alpha-only. A plain texture is sampled through the R8 image's alpha (see the A8 view path), and a render
+            // target is the same image with the colour-attachment usage: the title sizes a 3840x2160, 1-sample A8
+            // render target for its output mask, and refusing it here made the allocation query report the invalid
+            // D3D12 result, which the factory turned into a null resource the title then tripped over (measured: the
+            // slot-108 query for format 65, then the title's int3 asserts at game+0xABFE1B and game+0xCC2936).
+            if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.SampleDesc.Count != 1 ||
+                (desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)))
+                return {};
+            if ((desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) && !color_attachment_usable(VK_FORMAT_R8_UNORM)) {
+                log_once("A8_UNORM render targets need R8_UNORM colour-attachment support; format", desc.Format);
+                return {};
+            }
+            return Format{VK_FORMAT_R8_UNORM, VK_IMAGE_ASPECT_COLOR_BIT};
+        }
         if (desc.Format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP) {
             if ((desc.SampleDesc.Count != 1 && (!(desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) ||
                                                (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))) ||
@@ -8143,8 +8153,13 @@ public:
             D3D12_FORMAT_SUPPORT2 s2 = D3D12_FORMAT_SUPPORT2_NONE;
 
             if (fs->Format == DXGI_FORMAT_A8_UNORM) {
+                // A8 render targets are R8_UNORM images (the view moves the bits into alpha), so the format reports
+                // what the host can actually attach; measured: the title sizes one on this title's output path.
+                if (state_.color_attachment_usable(VK_FORMAT_R8_UNORM))
+                    fs->Support1 |= D3D12_FORMAT_SUPPORT1_RENDER_TARGET;
                 if (optimal & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) {
-                    fs->Support1 = D3D12_FORMAT_SUPPORT1_TEXTURE2D | D3D12_FORMAT_SUPPORT1_TEXTURECUBE |
+                    fs->Support1 = (fs->Support1 & D3D12_FORMAT_SUPPORT1_RENDER_TARGET) |
+                                   D3D12_FORMAT_SUPPORT1_TEXTURE2D | D3D12_FORMAT_SUPPORT1_TEXTURECUBE |
                                    D3D12_FORMAT_SUPPORT1_SHADER_LOAD;
                     if (optimal & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT)
                         fs->Support1 |= D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE | D3D12_FORMAT_SUPPORT1_SHADER_GATHER;

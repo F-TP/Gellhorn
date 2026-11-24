@@ -2294,7 +2294,9 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
                 if (descs && readable_range(descs, sizeof(D3D12_RESOURCE_DESC)) &&
                     descs->Dimension <= D3D12_RESOURCE_DIMENSION_TEXTURE3D) {
                     info = device->real->GetResourceAllocationInfo(static_cast<UINT>(a2), static_cast<UINT>(a3), descs);
-                    answered = info.SizeInBytes != 0;
+                    // D3D12 reports an unsupported size as UINT64_MAX, not 0; treating it as an answer published an
+                    // allocation the title's allocator then asserted on, so it counts as unanswered here.
+                    answered = info.SizeInBytes != 0 && info.SizeInBytes != UINT64_MAX;
                 }
                 if (!answered) {
                     // A description the host cannot size: report one 64 KiB-aligned allocation, which is the console
