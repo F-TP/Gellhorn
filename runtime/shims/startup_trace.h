@@ -350,10 +350,42 @@ inline std::uintptr_t& poke_lea_address() {
 }
 inline void set_poke_lea_address(void* address) { poke_lea_address() = reinterpret_cast<std::uintptr_t>(address); }
 
+// LEONIDA_STOP_INT3=<hex rva>[,<hex rva>...]: names up to four int3 sites that are NOT stepped over. A trap that follows
+// a null check is the title's own statement that something was passed wrong; stepping over it turns that statement into a
+// dereference somewhere else, with a much less useful fault. Stopping here instead lets the exception and the crash
+// report show the arguments and the chain of the code that handed the bad value in.
+inline std::uintptr_t* stop_int3_addresses() {
+    static std::uintptr_t addresses[4] = {};
+    return addresses;
+}
+
+inline bool is_named_stop_int3(std::uintptr_t address) {
+    if (!crash_image_base()) return false;
+    const char* list = std::getenv("LEONIDA_STOP_INT3");
+    if (!list) return false;
+    for (int i = 0; i < 4; ++i) {
+        auto* const slots = stop_int3_addresses();
+        if (slots[i] || !*list) break;
+        char* end = nullptr;
+        const auto rva = std::strtoull(list, &end, 16);
+        if (end == list) break;
+        slots[i] = reinterpret_cast<std::uintptr_t>(crash_image_base()) + rva;
+        list = (*end == ',') ? end + 1 : "";
+    }
+    for (int i = 0; i < 4; ++i)
+        if (stop_int3_addresses()[i] == address) return true;
+    return false;
+}
+
 inline bool skip_int3(EXCEPTION_POINTERS* info) {
     static const bool skip = GetEnvironmentVariableW(L"LEONIDA_SKIP_INT3", nullptr, 0) != 0;
     if (!skip || info->ExceptionRecord->ExceptionCode != EXCEPTION_BREAKPOINT || !info->ContextRecord) return false;
     const auto* at = static_cast<const unsigned char*>(info->ExceptionRecord->ExceptionAddress);
+    if (is_named_stop_int3(reinterpret_cast<std::uintptr_t>(at))) {
+        std::fprintf(stderr, "[rt] int3 at %s is named by LEONIDA_STOP_INT3: not stepping over it\n",
+                     where(reinterpret_cast<std::uint64_t>(at)).c_str());
+        return false;   // let the exception be reported instead of skipped
+    }
     for (unsigned i = 0; i < 4; ++i) {
         auto* const addresses = poke_log_addresses();
         if (!addresses[i] || reinterpret_cast<std::uintptr_t>(at) != addresses[i]) continue;
