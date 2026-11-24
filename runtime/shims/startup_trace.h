@@ -209,6 +209,35 @@ inline void log_exception(const EXCEPTION_POINTERS& info) {
 // LEONIDA_SKIP_INT3 (diagnostic, with --trace): an int3 in guest code is logged once per address and stepped over,
 // so a boot can be followed past the title's soft asserts (an int3 followed by code that carries on). Off by default:
 // a console title never reaches one in a correct run, so each skipped address is a finding, not a fix.
+// The console's GPU is AMD, and the title uses AMD-only instructions that an Intel host does not implement. CLZERO
+// (0F 01 FC) zeroes the 64-byte cache line holding RAX; the title uses it as a fast block clear (measured: a loop of
+// clzero / add rax,0x40 / cmp / jb zeroing a structure at startup). Emulate exactly that when the host raises
+// STATUS_ILLEGAL_INSTRUCTION, and report anything else once so an unexpected opcode is visible rather than silently
+// skipped.
+inline bool emulate_amd_instruction(EXCEPTION_POINTERS* info) {
+    if (!info->ExceptionRecord || info->ExceptionRecord->ExceptionCode != STATUS_ILLEGAL_INSTRUCTION ||
+        !info->ContextRecord)
+        return false;
+    auto& c = *info->ContextRecord;
+    const auto* at = reinterpret_cast<const unsigned char*>(c.Rip);
+    if (!at) return false;
+    if (at[0] == 0x0F && at[1] == 0x01 && at[2] == 0xFC) {   // clzero
+        const auto address = static_cast<std::uintptr_t>(c.Rax) & ~static_cast<std::uintptr_t>(63);
+        auto* line = reinterpret_cast<volatile unsigned char*>(address);
+        for (int i = 0; i < 64; ++i) line[i] = 0;
+        c.Rip += 3;
+        static std::atomic<bool> logged{false};
+        if (!logged.exchange(true, std::memory_order_relaxed))
+            std::fprintf(stderr, "[rt] emulated the AMD-only clzero instruction (zeroed a 64-byte line)\n");
+        return true;
+    }
+    static std::atomic<int> reported{0};
+    if (reported.fetch_add(1, std::memory_order_relaxed) < 4)
+        std::fprintf(stderr, "[rt] illegal instruction on the host: %02x %02x %02x at %p\n", at[0], at[1], at[2],
+                     reinterpret_cast<const void*>(c.Rip));
+    return false;
+}
+
 inline bool skip_int3(EXCEPTION_POINTERS* info) {
     static const bool skip = GetEnvironmentVariableW(L"LEONIDA_SKIP_INT3", nullptr, 0) != 0;
     if (!skip || info->ExceptionRecord->ExceptionCode != EXCEPTION_BREAKPOINT || !info->ContextRecord) return false;
@@ -227,6 +256,7 @@ inline bool skip_int3(EXCEPTION_POINTERS* info) {
 }
 
 inline LONG CALLBACK handler(EXCEPTION_POINTERS* info) {
+    if (emulate_amd_instruction(info)) return EXCEPTION_CONTINUE_EXECUTION;
     if (!enabled() || in_handler || !info || !info->ExceptionRecord) return EXCEPTION_CONTINUE_SEARCH;
     if (skip_int3(info)) return EXCEPTION_CONTINUE_EXECUTION;
     in_handler = true;
