@@ -60,6 +60,23 @@ extern "C" void leonida_register_graphics_standin(void* fn) {
     rt::d3d12::graphics_standin_slot() = reinterpret_cast<rt::d3d12::CreateGraphicsStandinFn>(fn);
 }
 
+// The fence dispatcher belongs to the Vulkan layer (d3d12_com.cpp), which the GPU-free test binaries do not link:
+// it registers here at startup the function that makes a fence value advance reach a console fence slot-12 cell
+// (docs/fence_slot12.md). With none registered the cell moves only when the fence is advanced through its proxy.
+namespace rt::d3d12_xs {
+namespace {
+FenceValueWatcherFn g_fence_value_watcher = nullptr;
+}  // namespace
+FenceValueWatcherFn fence_value_watcher() {
+    return g_fence_value_watcher;
+}
+}  // namespace rt::d3d12_xs
+
+// Called by d3d12_com.cpp's static initializer.
+extern "C" void leonida_register_fence_value_watcher(void* fn) {
+    rt::d3d12_xs::g_fence_value_watcher = reinterpret_cast<rt::d3d12_xs::FenceValueWatcherFn>(fn);
+}
+
 
 
 #include "../src/shader_library.h"  // leonida::fspx_payload_from_parts for slot 67
@@ -741,7 +758,63 @@ struct ChildProxy {
     void** real_vtable;
     unsigned slot_count;    // public slots the real object implements; the rest of the table is refused
     std::atomic<unsigned long> refs;
+    // Console fence slot 12 (docs/fence_slot12.md): the cell the proxy answers with. Shared because the watcher that
+    // moves it can be dispatched after the proxy is released; empty on a queue or allocator proxy.
+    std::shared_ptr<std::atomic<std::uint64_t>> value_cell;
+    std::atomic<std::uint64_t> watched_target{0};  // highest value a watcher was asked for
 };
+
+// ---- Console fence slot 12 (docs/fence_slot12.md) ----
+//
+// A title's wait loop calls slot 12 on a fence proxy, keeps the answer and polls [answer] with monitorx/mwaitx until
+// the word there reaches the value it wants. The word is the fence's completed value; the console keeps it in
+// CPU-visible memory and the method hands out its address. The proxy keeps a cell at that value, set from the real
+// fence when the method is called (and when the fence is advanced through a proxy) and from the Vulkan layer's fence
+// dispatcher for a target the GPU has not reached yet. The title's comparison is 56-bit: (value - target) has bit 55
+// clear once the value has reached the target, and UINT64_MAX is handled before it as "device removed".
+constexpr std::uint64_t kFenceValueSignBit = 0x0080000000000000ull;
+
+bool fence_value_reached(std::uint64_t value, std::uint64_t target) {
+    return ((value - target) & kFenceValueSignBit) == 0;
+}
+
+// The cell only goes up: an Xbox fence value is monotonic and UINT64_MAX (a removed device) is its top.
+void publish_fence_value(const std::shared_ptr<std::atomic<std::uint64_t>>& cell, std::uint64_t value) {
+    if (!cell) return;
+    std::uint64_t current = cell->load(std::memory_order_relaxed);
+    while (current < value &&
+           !cell->compare_exchange_weak(current, value, std::memory_order_release, std::memory_order_relaxed)) {
+    }
+}
+
+// The real fence's current value (GetCompletedValue, PC slot 8, read through the real vtable).
+void refresh_fence_value(ChildProxy* self) {
+    if (!self->value_cell) return;
+    using GetCompletedValueFn = std::uint64_t(WINAPI*)(void*);
+    publish_fence_value(self->value_cell,
+                        reinterpret_cast<GetCompletedValueFn>(self->real_vtable[8])(self->real));
+}
+
+// Registers a watch for a target the fence has not reached yet; the dispatcher writes the target into the cell once
+// the GPU reaches it. Harmless when the title only asks for the address and no wait follows.
+void watch_fence_value(ChildProxy* self, std::uint64_t target, std::uint64_t completed) {
+    if (!self->value_cell || completed == UINT64_MAX) return;
+    if (fence_value_reached(completed, target)) return;
+    const FenceValueWatcherFn watch = fence_value_watcher();
+    if (!watch) {
+        static std::atomic<bool> logged{false};
+        if (!logged.exchange(true, std::memory_order_relaxed))
+            std::fprintf(stderr,
+                         "[rt] d3d12_xs: no fence value watcher is registered; a fence slot-12 cell only moves when "
+                         "the fence is advanced through its proxy\n");
+        return;
+    }
+    std::uint64_t watched = self->watched_target.load(std::memory_order_relaxed);
+    while (watched < target && !self->watched_target.compare_exchange_weak(watched, target)) {
+    }
+    if (watched >= target) return;  // an earlier wait already asked for this value or a higher one
+    watch(self->real, self->value_cell, target);
+}
 
 template <ChildKind K>
 struct ChildStats {
@@ -1325,6 +1398,25 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
                          static_cast<unsigned long long>(a1), reinterpret_cast<void*>(a2));
         d3d12_trace::record(child_trace_name<K>(Slot));
         return hr_to_u64(S_OK);
+    } else if constexpr (K == ChildKind::fence && Slot == kConsoleFenceValueAddress) {
+        // Console fence slot 12. The measured caller is the title's wait loop (docs/fence_slot12.md): it calls
+        // (fence, target, &continuation, flags), keeps the answer and polls [answer] with monitorx/mwaitx until the
+        // word there reaches the target, treating UINT64_MAX as a removed device. The console keeps a fence's
+        // completed value in CPU-visible memory and this is its address, so the answer is the proxy's value cell.
+        note_child_slot<K>(Slot);
+        d3d12_trace::record(child_trace_name<K>(Slot));
+        if (!self->value_cell) return hr_to_u64(E_OUTOFMEMORY);  // the cell is made with the proxy
+        refresh_fence_value(self);
+        const std::uint64_t completed = self->value_cell->load(std::memory_order_acquire);
+        watch_fence_value(self, a1, completed);
+        static std::atomic<bool> logged{false};
+        if (!logged.exchange(true, std::memory_order_relaxed))
+            std::fprintf(stderr,
+                         "[rt] d3d12_xs: fence slot %u answered as the address of the completed-value cell "
+                         "(target 0x%llx, completed 0x%llx, flags 0x%llx)\n",
+                         Slot, static_cast<unsigned long long>(a1), static_cast<unsigned long long>(completed),
+                         static_cast<unsigned long long>(a3 & 0xff));
+        return reinterpret_cast<std::uint64_t>(self->value_cell.get());
     } else {
         note_child_slot<K>(Slot);
         // Console order: slots from Signal on name the PC method two below them (heap and allocator proxies keep their
@@ -1348,6 +1440,7 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
             return hr_to_u64(E_NOTIMPL);
         }
         d3d12_trace::record(child_trace_name<K>(Slot));  // "called": the real object's result is not inspected
+        [[maybe_unused]] const std::uint64_t fence_argument = a1;  // still the title's proxy when a fence is handed on
         if constexpr (K == ChildKind::queue && (real_slot == kQueueSignal || real_slot == kQueueWait))
             a1 = unwrap_object(a1);
         UnwrappedArray unwrapped_lists;
@@ -1364,7 +1457,21 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
                                                  std::uint64_t, std::uint64_t, std::uint64_t);
         // The console slot names this PC method, not the one at the same index.
         auto fn = reinterpret_cast<ForwardFn>(self->real_vtable[real_slot]);
-        return fn(self->real, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14);
+        const std::uint64_t result = fn(self->real, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14);
+        // Keep a fence's slot-12 cell in step with value changes the title causes through the proxies: Signal moves
+        // the value, GetCompletedValue is the value, and a queue Signal on a fence proxy is the console path that
+        // signals it (docs/fence_slot12.md).
+        if constexpr (K == ChildKind::queue) {
+            if (Slot == kConsoleQueueSignal) {
+                const auto* fence_proxy =
+                    reinterpret_cast<const ChildProxy*>(static_cast<std::uintptr_t>(fence_argument));
+                if (is_fence_proxy(fence_proxy)) refresh_fence_value(const_cast<ChildProxy*>(fence_proxy));
+            }
+        } else if constexpr (K == ChildKind::fence) {
+            if (real_slot == 8) publish_fence_value(self->value_cell, result);
+            else if (real_slot == 10) refresh_fence_value(self);
+        }
+        return result;
     }
 }
 
@@ -1437,11 +1544,20 @@ HRESULT wrap_child(IUnknown* created, DeviceProxy* device, const IID* riid, void
         proxy->slot_count = kQueuePublicSlots;
     } else if constexpr (K == ChildKind::fence) {
         proxy->slot_count = supports_iid(created, __uuidof(ID3D12Fence1)) ? kFence1PublicSlots : kFencePublicSlots;
+        // The cell console fence slot 12 answers with (docs/fence_slot12.md); its address is fixed for the proxy.
+        try {
+            proxy->value_cell = std::make_shared<std::atomic<std::uint64_t>>(std::uint64_t{0});
+        } catch (...) {
+            created->Release();
+            delete proxy;
+            return E_OUTOFMEMORY;
+        }
     } else {
         proxy->slot_count = kAllocatorPublicSlots;
     }
     proxy->refs.store(1, std::memory_order_relaxed);
     proxy_add_ref(device);  // the object keeps its Xbox-ABI device alive for GetDevice
+    if constexpr (K == ChildKind::fence) refresh_fence_value(proxy);  // the cell starts at the initial value
 
     const HRESULT hr = child_query_interface<K>(proxy, riid, out);
     if (FAILED(hr)) {

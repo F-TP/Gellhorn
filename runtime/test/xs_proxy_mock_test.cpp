@@ -24,6 +24,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iterator>
+#include <memory>
 #include <new>
 #include <utility>
 
@@ -69,6 +70,21 @@ namespace {
 
 namespace xs = rt::d3d12_xs;
 
+// Console fence slot 12 (docs/fence_slot12.md): the proxy answers with the address of the fence's completed-value
+// cell and, when the value has not reached the target the caller passed, asks the registered watcher to bring it
+// there. This is the GPU-free stand-in for the Vulkan layer's fence dispatcher: it records the request and the test
+// moves the value (the mock fence reaches a target through mock_call).
+unsigned g_watch_calls = 0;
+std::uint64_t g_watch_target = 0;
+std::atomic<std::uint64_t>* g_watched_cell = nullptr;
+void test_fence_watcher(IUnknown* real_fence, const std::shared_ptr<std::atomic<std::uint64_t>>& cell,
+                        std::uint64_t target) {
+    (void)real_fence;
+    ++g_watch_calls;
+    g_watch_target = target;
+    g_watched_cell = cell.get();
+}
+
 // ---- Mocks ----
 
 enum class Kind { device, queue, fence, resource, allocator, command_list, heap };
@@ -90,6 +106,7 @@ struct Mock {
     int device_level;        // device: highest ID3D12DeviceN it answers (0 = ID3D12Device only)
     int list_level;          // command_list: 0=base (60 slots), 7=GCL7 (81 slots), 8=GCL8 (82 slots)
     bool fence1;             // fence: answers ID3D12Fence1; device: the fences it makes do
+    std::uint64_t fence_value;  // fence: GetCompletedValue's answer; a Signal raises it
     bool allocator_tag;      // allocator: answers kLeonidaCommandAllocatorTag; device: the allocators it makes do
     bool create_null;        // device: creation returns create_result with no object
     HRESULT create_result;   // device: what creation returns (S_OK makes the object)
@@ -202,6 +219,7 @@ HRESULT mock_create(Mock* device, Kind kind, std::uint64_t riid, std::uint64_t o
     Mock* child = new_mock(kind);
     child->fence1 = device->fence1;
     child->allocator_tag = device->allocator_tag;
+    if (kind == Kind::fence) child->fence_value = kCompletedValue;
     device->last_child = child;
     return mock_query(child, reinterpret_cast<const IID*>(riid), out);
 }
@@ -234,7 +252,15 @@ std::uint64_t mock_call(Mock* m, unsigned slot, const std::uint64_t* words) {
         }
         return S_OK;
     }
-    if (m->kind == Kind::fence && slot == 8) return kCompletedValue;  // GetCompletedValue
+    if (m->kind == Kind::fence && slot == 8) return m->fence_value;  // GetCompletedValue
+    if (m->kind == Kind::fence && slot == 10) {                      // Signal(value)
+        if (a1 > m->fence_value) m->fence_value = a1;
+        return S_OK;
+    }
+    if (m->kind == Kind::queue && slot == 14 && a1) {  // Signal(fence, value): the real fence is the first argument
+        auto* const fence = reinterpret_cast<Mock*>(a1);
+        if (fence->kind == Kind::fence && a2 > fence->fence_value) fence->fence_value = a2;
+    }
     if (m->kind == Kind::queue && slot == 10) copy_array(m, slot, a2, a1);  // ExecuteCommandLists(count, lists)
     if (m->kind == Kind::command_list && slot == 28) copy_array(m, slot, a2, a1);  // SetDescriptorHeaps(count, heaps)
     return S_OK;
@@ -576,6 +602,28 @@ int check_fence1() {
         } else {
             EXPECT(slot11 == E_NOTIMPL && fence_mock->calls[11] == 0);  // not forwarded past an 11-slot vtable
         }
+        // Console fence slot 12 (docs/fence_slot12.md): the address of the fence's completed-value cell, answered by
+        // the proxy (not forwarded), fixed for the fence, and watched only for a target the value has not reached.
+        g_watch_calls = 0;
+        g_watch_target = 0;
+        g_watched_cell = nullptr;
+        const std::uint64_t cell_address = raw(fence, 12, kCompletedValue);
+        EXPECT(cell_address != 0 && fence_mock->calls[12] == 0);
+        auto* const cell = reinterpret_cast<std::atomic<std::uint64_t>*>(cell_address);
+        EXPECT(cell->load() == kCompletedValue && g_watch_calls == 0);  // reached: no watch asked for
+        EXPECT(raw(fence, 12, kCompletedValue + 2) == cell_address && fence_mock->calls[12] == 0);
+        EXPECT(g_watch_calls == 1 && g_watch_target == kCompletedValue + 2 && g_watched_cell == cell);
+        // A Signal through a queue proxy raises the mock fence's value and the proxy publishes it into the same cell.
+        void* queue = make_queue(device);
+        Mock* const real_queue = mock->last_child;
+        EXPECT(queue && real_queue && real_queue->kind == Kind::queue);
+        EXPECT(hr_of(raw(queue, 16, word(fence), kCompletedValue + 5, 0, 0)) == S_OK);
+        EXPECT(real_queue->calls[14] == 1 && real_queue->args[14][0] == word(fence_mock) &&
+               real_queue->args[14][1] == kCompletedValue + 5);
+        EXPECT(fence_mock->fence_value == kCompletedValue + 5 && cell->load() == kCompletedValue + 5);
+        EXPECT(raw(fence, 12, kCompletedValue + 1) == cell_address && cell->load() == kCompletedValue + 5 &&
+               g_watch_calls == 1);  // already reached: no second watch
+        EXPECT(release(queue) == 0 && real_queue->refs == 0);
         EXPECT(release(fence) == 0 && fence_mock->refs == 0);
 
         // Asked for as ID3D12Fence1: made as ID3D12Fence, then refused when the fence lacks Fence1, and released.
@@ -1024,7 +1072,8 @@ int check_tail(bool want_guarded) {
         EXPECT(hr_of(raw(queue, slot)) == E_NOTIMPL && queue_mock->calls[slot] == 0);
     }
     EXPECT(hr_of(raw(queue, 35)) == S_OK && queue_mock->calls[35] == 0);
-    for (unsigned slot = 12; slot < xs::fence_proxy_table_size(); ++slot) EXPECT(hr_of(raw(fence, slot)) == E_NOTIMPL);
+    // Console fence slot 12 is answered (the completed-value cell, check_fence1); the refused tail starts at 13.
+    for (unsigned slot = 13; slot < xs::fence_proxy_table_size(); ++slot) EXPECT(hr_of(raw(fence, slot)) == E_NOTIMPL);
     EXPECT(xs::queue_table_overruns() == 0 && xs::fence_table_overruns() == 0);
     EXPECT(release(queue) == 0 && release(fence) == 0 && release(device) == 0 && mock->refs == 0);
     return 0;
@@ -1387,6 +1436,10 @@ int check_console_command_list() {
 int main(int argc, char** argv) {
     no_dialogs();
     std::setvbuf(stdout, nullptr, _IONBF, 0);
+    // Console fence slot 12's watcher (docs/fence_slot12.md): the GPU-free stand-in for the Vulkan layer, which
+    // registers its fence dispatcher here in the runtime. It has to be in place before the fence checks call slot 12.
+    ::leonida_register_fence_value_watcher(
+        reinterpret_cast<void*>(static_cast<xs::FenceValueWatcherFn>(&test_fence_watcher)));
     if (argc == 2) {
         if (std::strcmp(argv[1], "--env-slots") == 0) return run_env_slots(true);
         if (std::strcmp(argv[1], "--env-slots-invalid") == 0) return run_env_slots(false);

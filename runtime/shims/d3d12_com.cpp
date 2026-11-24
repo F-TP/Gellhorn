@@ -1932,6 +1932,34 @@ private:
     } stamp_;
 };
 
+// Console fence slot 12 (docs/fence_slot12.md). The fence proxy in d3d12_xs_device.cpp hands a title the address of a
+// 64-bit cell that carries the fence's completed value, and the title polls it instead of calling back in. A wait for a
+// value the GPU has not reached yet registers here: the runtime's fence dispatcher already wakes on a timeline value,
+// so watching a cell is one enqueued callback, and it holds the cell until it fires. The callback writes the target;
+// it does not touch the fence, which may be released first (a cancelled wait's callback runs before its semaphore is
+// destroyed). A device loss drains the callbacks too, so the cell then reports the target rather than UINT64_MAX: the
+// removed device is reported by the runtime's own removal path, and the title's -1 branch handles that separately.
+void watch_fence_value_to_cell(IUnknown* real_fence, const std::shared_ptr<std::atomic<std::uint64_t>>& cell,
+                               std::uint64_t target) {
+    auto* const fence = Fence::from(real_fence);
+    if (!fence || !cell) return;
+    const VkSemaphore semaphore = fence->semaphore();
+    if (!semaphore) return;
+    auto* context = const_cast<leonida::VulkanContext*>(fence->context());
+    context->enqueue_fence_callback(semaphore, target, [cell, target] {
+        std::uint64_t current = cell->load(std::memory_order_relaxed);
+        while (current < target &&
+               !cell->compare_exchange_weak(current, target, std::memory_order_release, std::memory_order_relaxed)) {
+        }
+    });
+}
+
+// The proxy's slot-12 handler reads the watcher through this registration (d3d12_xs_device.cpp declares the store).
+const bool fence_value_watcher_registered = [] {
+    ::leonida_register_fence_value_watcher(reinterpret_cast<void*>(&watch_fence_value_to_cell));
+    return true;
+}();
+
 }  // namespace
 
 HRESULT create_command_queue(leonida::VulkanContext& context, VkQueue queue, std::uint32_t queue_family,

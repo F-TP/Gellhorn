@@ -49,8 +49,10 @@
 
 #include <d3d12.h>
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 
 namespace rt::d3d12_xs {
 
@@ -128,6 +130,24 @@ unsigned queue_proxy_slot_count(const void* queue);
 unsigned fence_proxy_slot_count(const void* fence);
 unsigned queue_proxy_table_size();
 unsigned fence_proxy_table_size();
+// ---- Console fence slot 12 (vtable offset 0x60) ----
+//
+// A fence proxy answers console fence slot 12 with the address of a 64-bit cell that carries the fence's completed
+// value. Measured from the title's wait loop (docs/fence_slot12.md): it calls (fence, target, &continuation, flags),
+// keeps the result, then polls [result] with monitorx/mwaitx until the word there reaches the target, testing it
+// with the title's 56-bit comparison and treating UINT64_MAX as a removed device. The PC ID3D12Fence chain ends at
+// 11/12, so this method is a console extension: the console keeps a fence's completed value in CPU-visible memory,
+// and this is its address, which is why the title stores its fence as the waitable of its submit channel.
+//
+// The cell is the proxy's copy of that value. It is set from the real fence when slot 12 is called and when the
+// fence is advanced through a proxy, and a target the fence has not reached yet is handed to the Vulkan layer's
+// fence dispatcher so GPU completion moves the cell too. This file has no Vulkan dependency (it is also linked into
+// the GPU-free test binaries), so the layer registers the watcher at startup; with none registered the cell moves
+// only when the fence is advanced through its proxy, and the first such wait says so in the log.
+inline constexpr unsigned kConsoleFenceValueAddress = 12;
+using FenceValueWatcherFn =
+    void (*)(IUnknown* real_fence, const std::shared_ptr<std::atomic<std::uint64_t>>& cell, std::uint64_t target);
+
 // Live references on a queue, fence or allocator proxy (0 for anything else). Test helper.
 unsigned long command_object_proxy_ref_count(const void* object);
 // Per-slot call counters and first-call flags, shared by all queue proxies and all fence proxies.
@@ -200,3 +220,7 @@ bool heap_slot_first_call_seen(unsigned slot);
 void reset_device_proxy_stats();
 
 }  // namespace rt::d3d12_xs
+
+// Called once by the Vulkan layer at startup with its rt::d3d12_xs::FenceValueWatcherFn (a void* so this header does
+// not have to name the function-pointer type twice; the layer checks the type). See console fence slot 12 above.
+extern "C" void leonida_register_fence_value_watcher(void* fn);
