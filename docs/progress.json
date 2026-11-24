@@ -1,6 +1,6 @@
 {
   "updated": "2026-11-24",
-  "commit": "d8229b5b1",
+  "commit": "be9a2bc3f",
   "intro": "Measured on one machine (Windows 11, Intel 13900K, RTX 4090) against a retail Xbox Series 1.0.2.1 package. Every row below is an outcome the project produces, not a plan; the commands that produce them are in the Build section, and the failures behind each number are in docs/boot_frontier.md.",
   "stages": [
     {
@@ -45,27 +45,61 @@
     }
   ],
   "counts": [
-    { "what": "D3D12 calls in a retail boot", "value": "11,986" },
-    { "what": "Pipeline creation failures", "value": "0" },
-    { "what": "Carved game shader modules", "value": "26,503" },
-    { "what": "SPIR-V modules indexed", "value": "26,616" },
-    { "what": "FidelityFX pipeline programs translated", "value": "29 / 29" },
-    { "what": "Crash-report frames walked over .pdata", "value": "9 per fault" }
+    {
+      "what": "D3D12 calls in a retail boot",
+      "value": "11,986"
+    },
+    {
+      "what": "Pipeline creation failures",
+      "value": "0"
+    },
+    {
+      "what": "Carved game shader modules",
+      "value": "26,503"
+    },
+    {
+      "what": "SPIR-V modules indexed",
+      "value": "26,616"
+    },
+    {
+      "what": "FidelityFX pipeline programs translated",
+      "value": "29 / 29"
+    },
+    {
+      "what": "Refused graphics pipeline creations (console slot 57, before the conversion)",
+      "value": "10,242"
+    },
+    {
+      "what": "Console slot 57 stage pairs measured",
+      "value": "6 (VS, PS, DS, HS, GS and one more)"
+    }
   ],
   "frontier": {
     "stop": "game+0xcc2861",
-    "summary": "a read at 0x10 because a small container element is null: the title builds the container empty and reads its first element as an object pointer, and its own null check then reaches a compiler trap. The next candidate is the 10,242 CreateLifetimeTracker calls that still return E_NOTIMPL.",
+    "summary": "a read at 0x10 because a small container element is null: the title builds the container empty and reads its first element as an object pointer, and its own null check then reaches a compiler trap. The null traces back to a pipeline state the title never received: console device slot 57 is graphics PSO creation (measured from the call itself - IID_ID3D12PipelineState, a root signature and six native-code stage pairs), and forwarding it by slot number turned 10,242 of those calls into refused CreateLifetimeTracker calls.",
     "detail_doc": "docs/boot_frontier.md"
   },
   "next": [
-    "rule in or out ID3D12LifetimeTracker, which the title creates 10,242 times and currently gets back as a null",
+    "implement console slot 57 as graphics PSO creation from native code, then re-measure the boot",
     "follow what should populate the container whose first element is null",
     "refresh this block with `python -I tools/readme_progress.py` after each measured change"
   ],
   "links": [
-    { "what": "the full measurement ladder", "where": "docs/boot_frontier.md" },
-    { "what": "the null-object chain trace", "where": "docs/null_object_chain.md" },
-    { "what": "how the other public attempt is built", "where": "docs/competitor_intel.md" },
-    { "what": "incoming reports and tracked findings", "where": "docs/issues.md" }
+    {
+      "what": "the full measurement ladder",
+      "where": "docs/boot_frontier.md"
+    },
+    {
+      "what": "the null-object chain trace",
+      "where": "docs/null_object_chain.md"
+    },
+    {
+      "what": "how the other public attempt is built",
+      "where": "docs/competitor_intel.md"
+    },
+    {
+      "what": "incoming reports and tracked findings",
+      "where": "docs/issues.md"
+    }
   ]
 }
