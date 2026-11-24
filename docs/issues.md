@@ -4,7 +4,7 @@ Ledger of **what people are sending** to the project's GitHub home, plus our own
 Maintained by the issue-tracker agent as a standing, read-only-plus-this-file role.
 
 **Repo:** `F:\leonida`, branch `main`, HEAD `62b510467` · **GitHub:** [luizwidmer/palmetto](https://github.com/luizwidmer/palmetto)
-**Updated:** 2026-11-24 · **Incoming:** 2 open (#2, #3 + 1 third-party comment) · **Ours open:** 8 (O1=#4, O3 partial, O4, O5, O6, O7, O8, O9) · **Fixed:** 7 · **#5 closed:** 1 · **Open PRs:** 0.
+**Updated:** 2026-11-24 · **Incoming:** 2 open (#2, #3 + 1 third-party comment) · **Ours open:** 8 (O1=#4, O3 partial, O4, O5, O6, O8, O9, O10) · **Fixed:** 8 · **#5 closed:** 1 · **Open PRs:** 0.
 
 **Policy: ledger only.** Do not open, comment on, close, delete or edit GitHub issues/PRs, or commit/push, without an
 explicit ask. Draft replies below are **HOLD** — the repo owner has not approved public replies; nothing has been posted.
@@ -16,7 +16,7 @@ explicit ask. Draft replies below are **HOLD** — the repo owner has not approv
 | #2 | bittertea0323 | open · ours to answer | Independent reproduction, Windows 10 + RTX 4070 SUPER: two host build blockers (a .NET SDK pin and one unit test under newer MSVC), 26,633 SPIR-V modules, a run at the documented frontier, slot 108 publishing 0, then a fault ten frames deep in title code. Asks whether that fault is the expected slot-108 consequence, and whether console GPU-VA dereference is this layer or the translator | External, older tree, not a duplicate; Q2 is answered by O6, Q1 still open — draft held |
 | #3 | bittertea0323 | open · ours to answer | FSPX corpus on a second host: 18/29 translate, 11 fail `fall-through into undecodable words` and cluster on wave32; per-program word counts; asks for a preferred report shape | Addressed by `0276f2b1f` (repair → 29/29); draft held. **Comment (NinosTech, 09:21Z):** four FSPX translations from an older upstream revision cleared four lookup misses and made the 42 compute-pipeline calls succeed, but the captured frame still had 0 non-black pixels of 896,232; not matched to our cases — see note below |
 
-Closed: #1 — PR "Main"; #5 — closed as completed on `4178c742c`, new frontier is O7, not a reopen.
+Closed: #1 — PR "Main"; #5 — closed as completed on `4178c742c` (its own stop was fixed; later frontiers are tracked as separate items, not a reopen).
 
 ## Draft replies (HOLD — not posted; awaiting repo-owner approval)
 
@@ -38,17 +38,19 @@ Closed: #1 — PR "Main"; #5 — closed as completed on `4178c742c`, new frontie
 | O4 | runtime | Console slot 57's deserialized graphics-pipeline record → PC graphics PSO conversion | open — **needed for rendering; not the boot blocker**, below O7 | 10,241 stand-in states handed out (`LEONIDA_STANDIN_PIPELINES=1`, `dbf2b8b49`): same call 11,986, same `game+0xcc2861` stop, same null; still refused without the conversion (`7c70724b7`, `docs/boot_frontier.md`) |
 | O5 | build (test hygiene) | `runtime/test/d3d12_existing_heap_test.cpp` fails on HEAD: `CreatePlacedResource` on an existing heap expects `E_NOTIMPL`, gets `E_INVALIDARG` (~L163) | open, low | not built by `_setup/build_tests.cmd` (verified: no reference), which is why it rotted; reported by the tracker agent's build |
 | O6 | runtime | Unified-memory requirement: the title CPU-dereferences console GPU image addresses; our fabricated VAs (from `1 << 32`) are unmapped | open | `LEONIDA_BACK_IMAGES=1` makes the read succeed and moves the fault to a null+offset write, so resource GPU addresses must be CPU-visible (`e604c28a6`, `docs/boot_frontier.md`) |
-| O7 | runtime | **Find what should populate the null container element at the current stop** — element 0 of an inline small-vector buffer; class vtable `image+0x6597C60`, constructor `game+0x1B37440` | open — **the frontier, highest priority** | measured stop `game+0xcc2861` (read at 0x10); stand-ins proved the graphics pipelines are not it (`dbf2b8b49`, `62b510467`, `docs/boot_frontier.md`) |
 | O8 | build | Shader stage's completeness gate blocks the designed `--stages shaders` path: the translator refuses two duplicate-name variants the old corpus had, so stages had to be run individually | open | `62b510467`, `9271ef74c`; `docs/boot_frontier.md` |
 | O9 | build/perf | Pipeline-library disassembly is quadratic: `llvm-mc` prints the whole input hex line once per invalid vcc-tuple word, so a 120 KB program becomes a 100–134 MB listing (one file 137 MB); 841 of 2,684 programs in 17 minutes, 9.4 GB | open | `docs/boot_frontier.md` (disassembly-cost section), `9271ef74c`, `62b510467` — not yet in `pipeline_program_source.md` |
+| O10 | runtime | New frontier stop `game+0x4fb0aec`: call through `qword [rax+0x60]` where `rax = [rcx]`; the object's first qword is `0x3b9aca00` (10^9) where its vtable pointer belongs, and `rcx` is a plausible heap address | open — **frontier, highest priority** | reached from glue wrapper `game+0x4fb0a90` (two-word callback struct holding a pointer to `game+0x10a330`), caller `game+0x23cf363`; find who wrote 10^9 there — a size written where a vtable pointer belongs (layout mismatch) or a title sentinel a class slot must test (`cc7e044b2`, `13d67ae32`, `docs/boot_frontier.md`) |
 
-**Highest priority: O7** — what should have populated the null container element is now the boot frontier. O4 stays open
-for rendering; O3's remaining piece is the highest-value debugging gap.
+**Highest priority: O10** — the new `game+0x4fb0aec` garbage-vtable stop is the frontier. O7 is answered (`docs/container_element.md`,
+fixed in `cc7e044b2`); O4 stays needed for rendering only, the container measurement being the reason. O3's remaining piece
+is the highest-value debugging gap.
 
 ## Our findings — fixed
 
 | area | item | state | evidence |
 |---|---|---|---|
+| d3d12 | A8_UNORM render targets accepted as R8_UNORM colour attachments with `RENDER_TARGET` feature, and slot-108 bridge treats `SizeInBytes == UINT64_MAX` as unanswered (answered O7) | fixed `cc7e044b2` | element 0 was a 3840x2160, 1-sample A8_UNORM render target whose format gate refused `ALLOW_RENDER_TARGET`; slot 108 published the invalid allocation and the factory returned null (`docs/container_element.md`, `13d67ae32`; class corrected to vtable `image+0x658DA80` / ctor `game+0x185570`); "format not supported yet: 65" gone, stop `game+0xcc2861` → `game+0x4fb0aec`, traced call 11,986 → 12,085 |
 | build | `make_game` publishes the 1,266 graphics programs the title asks for (947 PS + 319 VS), with step ownership and shard-plan alignment | fixed `9271ef74c` | 1,266/1,266 found, translated and `spirv-val` clean; published as 1,337 fspx entries beside 29 FSPX + 42 library compute |
 | runtime | Console queue slot 18 `GetDesc` struct-return order (the clobbered `rbx` at `game+0x2484133`) | fixed `4178c742c` | stop moved to `game+0xcc2861`, D3D12 calls 11,906 → 11,986 (was O2; GH #5 closed as completed) |
 | build | Pipeline-library extraction and FSPX listing repair wired into `make_game.py` | fixed `0276f2b1f` | FSPX 29/29 with the repair (22/29 without); library 42/42 on the 42-program extraction, 1,047/1,684 on a real package subset |
@@ -63,16 +65,14 @@ for rendering; O3's remaining piece is the highest-value debugging gap.
   ended → crashed shard repaired solo → 16 parts merged (26,501), stages re-run (fspx 29/29, bvh 52/52, graphics
   1,266/1,266) + 42 library compute republished → 27,890 loaded, baseline restored (`62b510467`). **A background job
   does not outlive an agent turn.**
-- **TLS rewrite (loader).** 53,246 `gs:[58h]` reads are rewritten to the TEB; `LEONIDA_TEB_CHECK=1` confirms `0x1480 +
-  8*slot` is right here and the faulting thread's TLS cells are correct (`443639062`, `91a01b5ea`). The public attempt agrees.
+- **TLS rewrite (loader).** 53,246 `gs:[58h]` reads are rewritten to the TEB; `LEONIDA_TEB_CHECK=1` confirms `0x1480 + 8*slot` is right and the faulting thread's TLS cells are correct (`443639062`, `91a01b5ea`); the public attempt agrees.
 - **Pipeline-library translation is partial by design.** 42/42 on the dedicated 42-program extraction, 1,047/1,684 (~62%)
   on a real package subset (`0276f2b1f`); the FSPX set needs the `widen_smem_decode` repair. Not a boot front today.
 - **Historical: the eleven "missing" pipeline programs** were zeroed library reads from the refused zlib stage, not a
   second container or a load-time patch; resolved by `ae876f4b5` (see `docs/pipeline_program_source.md`).
 - **External (GH #3, NinosTech): lookups can succeed and the frame still be black.** Four FSPX translations cleared four
   misses and the 42 compute calls succeeded, yet 0 non-black pixels of 896,232; matching to our cases needs his hashes.
-- **Lifetime-tracker prototype (evidence, not a fix).** Implemented correctly and unit-tested, then reverted because the
-  boot regressed 11,986 → 1,653 calls through a wrong vtable slot — evidence that console slot 57 is not a tracker (`O4`).
+- **Lifetime-tracker prototype (evidence, not a fix).** Implemented correctly and unit-tested, then reverted because the boot regressed 11,986 → 1,653 calls through a wrong vtable slot — evidence slot 57 is not a tracker (`O4`).
 - **docs.** `docs/competitor_intel.md` records the public attempt (<https://github.com/Marvisak/VIctory>): DXIL + host D3D12
   vs our SPIR-V + Vulkan, prepare-then-map loader, crash reporter with stack unwind, mechanical asset policy; GPL-3.0 like
   ours, so reuse is permitted with attribution. README's progress tracker is generated from `docs/progress.json` by
