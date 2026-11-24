@@ -1995,24 +1995,56 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
                          static_cast<unsigned long long>(a1), static_cast<unsigned long long>(a2),
                          static_cast<unsigned long long>(a3));
         return hr_to_u64(E_NOTIMPL);
-    } else if constexpr (Slot == 108 || Slot == 109) {
-        // Measured from the title's call site: both slots are called as (out, object) with the first argument pointing
-        // at a stack dword that the caller reads afterwards, and the second unchanged across the pair. They are console
-        // extensions past the PC device table, so there is no PC method to forward to. Answer success and publish zero,
-        // which is what the callers' `test eax, eax` expects from a getter with nothing to report. Logged, and only
-        // where a caller-supplied dword is actually writable.
+    } else if constexpr (Slot == 108) {
+        // Console extension: GetResourceAllocationInfo in the console's struct-return order. The hidden 16-byte return
+        // buffer arrives in RCX (this thunk's `self`), the device proxy in RDX (`a1`), the two counts in R8/R9 and the
+        // description array on the stack (`a4`). Measured at the title's call sites: it reads the 16 bytes back and
+        // compares the alignment with 0x1000, then treats the size's high dword as an assert. Answering success without
+        // writing the buffer left a garbage size, the title's allocator asserted and the resource factory returned null,
+        // which is what the boot then dereferenced.
         note_slot(Slot);
-        static std::atomic<int> logged{0};
-        if (logged.fetch_add(1, std::memory_order_relaxed) < 4)
-            std::fprintf(stderr, "[rt] d3d12_xs: device slot %u publishes 0 to its first argument (console extension)\n",
-                         Slot);
-        // Only publish into a caller stack slot. One of the measured call sites passes the address of a dword on its
-        // own frame; another passes an object field, and writing zero there would zero the low half of a pointer (the
-        // run then called through the corrupted value). A stack address is within a few megabytes of this frame.
-        const auto here = reinterpret_cast<std::uintptr_t>(&a1);
-        const auto target = static_cast<std::uintptr_t>(a1);
-        const auto distance = target > here ? target - here : here - target;
-        if (a1 && distance < (16u << 20) &&
+        if (is_device_proxy(reinterpret_cast<const void*>(a1))) {
+            auto* device = reinterpret_cast<DeviceProxy*>(a1);
+            if (device->real && device->real_vtable) {
+                const auto* descs = reinterpret_cast<const D3D12_RESOURCE_DESC*>(a4);
+                D3D12_RESOURCE_ALLOCATION_INFO info{};
+                bool answered = false;
+                if (descs && readable_range(descs, sizeof(D3D12_RESOURCE_DESC)) &&
+                    descs->Dimension <= D3D12_RESOURCE_DIMENSION_TEXTURE3D) {
+                    info = device->real->GetResourceAllocationInfo(static_cast<UINT>(a2), static_cast<UINT>(a3), descs);
+                    answered = info.SizeInBytes != 0;
+                }
+                if (!answered) {
+                    // A description the host cannot size: report one 64 KiB-aligned allocation, which is the console
+                    // alignment this caller expects and never over-commits.
+                    static std::atomic<bool> logged{false};
+                    if (!logged.exchange(true, std::memory_order_relaxed))
+                        std::fprintf(stderr,
+                                     "[rt] d3d12_xs: slot 108 could not size the description, reporting 64 KiB / "
+                                     "64 KiB alignment\n");
+                    info.Alignment = 0x10000;
+                    info.SizeInBytes = 0x10000;
+                }
+                std::memcpy(reinterpret_cast<void*>(self), &info, sizeof(info));
+                // The fifth stack argument is the per-description record array (offset, alignment, size per desc).
+                auto* records = reinterpret_cast<D3D12_RESOURCE_ALLOCATION_INFO1*>(a5);
+                if (records && readable_range(records, sizeof(D3D12_RESOURCE_ALLOCATION_INFO1))) {
+                    records[0].Offset = 0;
+                    records[0].Alignment = info.Alignment;
+                    records[0].SizeInBytes = info.SizeInBytes;
+                }
+                return reinterpret_cast<std::uint64_t>(self);
+            }
+        }
+        return hr_to_u64(E_NOTIMPL);
+    } else if constexpr (Slot == 109) {
+        // Console extension measured like 108 but not on this path yet: publish zero into a caller stack slot only, which
+        // is all its measured call sites expect.
+        note_slot(Slot);
+        const auto here109 = static_cast<std::uintptr_t>(static_cast<std::uintptr_t>(reinterpret_cast<std::uintptr_t>(&a1)));
+        const auto target109 = static_cast<std::uintptr_t>(a1);
+        const auto distance109 = target109 > here109 ? target109 - here109 : here109 - target109;
+        if (a1 && distance109 < (16u << 20) &&
             readable_range(reinterpret_cast<const void*>(a1), sizeof(std::uint32_t)))
             *reinterpret_cast<std::uint32_t*>(a1) = 0;
         return hr_to_u64(S_OK);
