@@ -1618,7 +1618,61 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
                          static_cast<unsigned long long>(a3), static_cast<unsigned long long>(a4));
         d3d12_trace::record(child_trace_name<K>(Slot), "unsupported");
         return hr_to_u64(E_NOTIMPL);
-} else if constexpr (K == ChildKind::queue && Slot == 35) {
+} else if constexpr (K == ChildKind::queue && Slot == 32) {
+        // Console PresentX, past the PC queue table (docs/d3d12_xs_surface.md 7.1: (plane count, planes, params), plane
+        // entries 0x48 bytes with Token @0x00, ResourceCount @0x08, ppResources @0x10, ...). The first calls are dumped
+        // once so the real shape decides the wiring instead of the public layouts alone. LEONIDA_PRESENT_STUB=1 answers
+        // S_OK without presenting - a measurement of whether present success changes the title's loop, never a fix.
+        note_child_slot<K>(Slot);
+        static std::atomic<bool> dumped{false};
+        if (!dumped.exchange(true, std::memory_order_relaxed)) {
+            std::fprintf(stderr,
+                         "[rt] d3d12_xs: PresentX probe: planes %llu at %p, params %p\n",
+                         static_cast<unsigned long long>(a1), reinterpret_cast<void*>(a2),
+                         reinterpret_cast<void*>(a3));
+            MEMORY_BASIC_INFORMATION mbi{};
+            const bool readable = a2 && VirtualQuery(reinterpret_cast<const void*>(a2), &mbi, sizeof(mbi)) ==
+                                               sizeof(mbi) &&
+                                  mbi.State == MEM_COMMIT && !(mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD));
+            if (readable) {
+                const auto* plane_words = reinterpret_cast<const std::uint64_t*>(a2);
+                const auto* plane_bytes = reinterpret_cast<const std::uint8_t*>(a2);
+                std::uint32_t resource_count = 0;
+                std::uint64_t resources = 0;
+                std::memcpy(&resource_count, plane_bytes + 0x08, sizeof(resource_count));
+                std::memcpy(&resources, plane_bytes + 0x10, sizeof(resources));
+                std::fprintf(stderr,
+                             "[rt]   plane 0: token 0x%llx resources %u at %p, colour space %d scale filter %d flags 0x%x\n",
+                             static_cast<unsigned long long>(plane_words[0]), resource_count,
+                             reinterpret_cast<void*>(resources),
+                             *reinterpret_cast<const int*>(plane_bytes + 0x28),
+                             *reinterpret_cast<const int*>(plane_bytes + 0x2C),
+                             *reinterpret_cast<const unsigned*>(plane_bytes + 0x40));
+                MEMORY_BASIC_INFORMATION list_mbi{};
+                const bool list_readable =
+                    resources && VirtualQuery(reinterpret_cast<const void*>(resources), &list_mbi, sizeof(list_mbi)) ==
+                                     sizeof(list_mbi) &&
+                    list_mbi.State == MEM_COMMIT && !(list_mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD));
+                if (list_readable && resource_count)
+                    std::fprintf(stderr, "[rt]   plane 0 resource 0: %p\n",
+                                 reinterpret_cast<void*>(reinterpret_cast<const std::uint64_t*>(resources)[0]));
+            }
+        }
+        static const bool stub = GetEnvironmentVariableA("LEONIDA_PRESENT_STUB", nullptr, 0) != 0;
+        if (stub) {
+            static std::atomic<std::uint64_t> stubbed{0};
+            const std::uint64_t n = stubbed.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (n <= 3)
+                std::fprintf(stderr,
+                             "[rt] d3d12_xs: PresentX call %llu answered S_OK by LEONIDA_PRESENT_STUB (nothing "
+                             "presented)\n",
+                             static_cast<unsigned long long>(n));
+            d3d12_trace::record(child_trace_name<K>(Slot));
+            return hr_to_u64(S_OK);
+        }
+        d3d12_trace::record(child_trace_name<K>(Slot), "unsupported");
+        return hr_to_u64(E_NOTIMPL);
+    } else if constexpr (K == ChildKind::queue && Slot == 35) {
         // The console's submit. Measured (docs/render_loop.md): the title's frame function calls it as
         // (count, command-list array, frame token, reserved), with the array being the same storage the startup filled
         // with command lists; there is no ExecuteCommandLists call anywhere in the boot. The earlier answer here - a
