@@ -183,7 +183,11 @@ inline std::string debug_text(const EXCEPTION_RECORD& r) {
     return utf8_from_ansi(a, static_cast<int>(n ? n - 1 : strlen(a)));
 }
 
+// Defined below in this namespace; declared here so the fault path can call it before its definition.
+inline void save_crash_ranges(const EXCEPTION_POINTERS&);
+
 inline void log_exception(const EXCEPTION_POINTERS& info) {
+    save_crash_ranges(info);   // self-gated by LEONIDA_CRASH_SAVE; independent of the crash report switch
     const EXCEPTION_RECORD& r = *info.ExceptionRecord;
     try {
         if (r.ExceptionCode == kDbgPrint || r.ExceptionCode == kDbgPrintWide) {
@@ -296,6 +300,55 @@ inline bool handle_repoke(EXCEPTION_POINTERS* info) {
     }
     repoke_address() = 0;
     return true;
+}
+
+// LEONIDA_CRASH_SAVE=<hex rva>:<hex length>[,<hex rva>:<hex length>...] writes those parts of the mapped image to files
+// beside the crash report (or to LEONIDA_CRASH_SAVE_DIR) when the title faults. The crash report names the frame; this
+// keeps the memory that frame was reading, so a wrong pointer can be told apart from a wrong object after the process is
+// gone. Runs on the fault path, so it allocates nothing: a stack buffer, CreateFileW and WriteFile.
+inline void save_crash_ranges(const EXCEPTION_POINTERS& info) {
+    const char* spec = std::getenv("LEONIDA_CRASH_SAVE");
+    if (!spec) return;
+    char dir[MAX_PATH] = {};
+    const DWORD dir_length = GetEnvironmentVariableA("LEONIDA_CRASH_SAVE_DIR", dir, MAX_PATH);
+    if (dir_length == 0 || dir_length >= MAX_PATH) {
+        if (GetTempPathA(MAX_PATH, dir) == 0) return;
+    }
+    const auto image = reinterpret_cast<std::uintptr_t>(crash_image_base());
+    const char* at = spec;
+    while (*at) {
+        char* end = nullptr;
+        const auto rva = std::strtoull(at, &end, 16);
+        if (end == at) break;
+        if (*end != ':') break;
+        at = end + 1;
+        const auto length = std::strtoull(at, &end, 16);
+        at = (*end == ',') ? end + 1 : end;
+        if (length == 0 || length > (64ull << 20)) continue;
+        const auto address = image + rva;
+        const auto* bytes = reinterpret_cast<const std::uint8_t*>(address);
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (VirtualQuery(bytes, &mbi, sizeof(mbi)) != sizeof(mbi) || mbi.State != MEM_COMMIT ||
+            (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD))) {
+            continue;   // unreadable page: skip it rather than fault inside the handler
+        }
+        char path[MAX_PATH] = {};
+        std::snprintf(path, sizeof(path), "%s\\crash_image_%llx_%llx.bin", dir,
+                      static_cast<unsigned long long>(rva), static_cast<unsigned long long>(length));
+        HANDLE file = CreateFileA(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (file == INVALID_HANDLE_VALUE) continue;
+        std::uint8_t buffer[64 << 10];
+        std::size_t left = static_cast<std::size_t>(length);
+        const std::uint8_t* cursor = bytes;
+        while (left) {
+            const std::size_t chunk = left < sizeof(buffer) ? left : sizeof(buffer);
+            DWORD written = 0;
+            if (!WriteFile(file, cursor, static_cast<DWORD>(chunk), &written, nullptr) || written != chunk) break;
+            cursor += chunk;
+            left -= chunk;
+        }
+        CloseHandle(file);
+    }
 }
 
 inline bool emulate_amd_instruction(EXCEPTION_POINTERS* info) {

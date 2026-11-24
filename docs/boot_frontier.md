@@ -397,22 +397,45 @@ pointer, so a tracker object is the first thing to rule in or out: an earlier pr
 11,894 -> 1,653) through a wrong vtable slot, which means the interface order must be exact, and the run has to be
 compared against 11,986 calls and the `game+0xcc2861` stop before the change is kept.
 
-## Frontier 2026-11-24 (slot 57 measured)
+## Frontier 2026-11-24 (slot 57 is a deserialized graphics pipeline record)
 
-Console device slot 57 is not the PC method its index reaches: with the proxy forwarding it by position it became
-ID3D12Device5::CreateLifetimeTracker, which refused 10,242 times in one boot. Probed instead of assumed, the call is
-**graphics PSO creation**:
+Console device slot 57 forwards by index to PC `ID3D12Device5::CreateLifetimeTracker`, which refused 10,242 calls in one
+boot. Probed instead of assumed, it is a **deserialized graphics pipeline record**, the graphics analogue of slot 67's
+compute record - not `CreateGraphicsPipelineState` and not six stage bytecodes:
 
-* 
-iid is IID_ID3D12PipelineState (765a30f3-f624-4c6f), not a tracker IID.
-* The descriptor at a1 starts with the root signature and then **six** pointer/size pairs, 0x10 bytes each: VS at +0x08
-  (388 B), PS at +0x18 (188 B), DS at +0x28 (448 B), HS at +0x38 (208 B), GS at +0x48 (384 B), and a sixth at +0x58
-  (752 B). Everything after +0x68 is zero in the first call.
-* The code is **native, not DXBC** (first bytes 08 d8 05 40, 56 6e 6f ea, ...), i.e. the same kind of program the
-  compute slot 67 wraps as an FSPX kind-6 payload before the device resolves it from the shader index.
+| offset | size | content | matched against |
+|---|---|---|---|
+| +0x00 | - | root signature | - |
+| +0x08 | 388 B | fixed-function **state blob** | library blob 11315 |
+| +0x18 | 188 B | **input-layout** blob | library blob 11316 |
+| +0x28 | 448 B | native **PS** program | program 842 = `lib_ps_00842` |
+| +0x38 | 208 B | PS **kind-2 stage blob** | library blob 11317 |
+| +0x48 | 384 B | native **VS** program | program 843 = `lib_vs_00843` |
+| +0x58 | 752 B | VS **kind-2 stage blob** | library blob 11318 |
 
-So the 10,242 refusals are failed graphics pipeline creations, and the null the title later dereferences is a pipeline
-state it never received. The conversion to write: build a PC D3D12_GRAPHICS_PIPELINE_STATE_DESC from this descriptor,
-wrap each stage's native program the way slot 67 wraps compute code, identify the sixth pair (the count suggests a
-mesh/amplification pair the console descriptor carries), and route to CreateGraphicsPipelineState. Until then the probe
-refuses, exactly as the forwarded slot did.
+Exactly one library graphics record holds state 11315 + layout 11316 (record hash `2f04ef59bc062cf8`, slots 0 -> (842,
+11317) and 1 -> (843, 11318), slots 2..6 unused), so the descriptor is that record expanded: root signature, state blob,
+input-layout blob, then (program, stage blob) pairs **in record-slot order - PS first, VS second**. The first call is not
+always the same record; every sample has the six-pair shape.
+
+Programs are keyed by **SHA-256 of the native program bytes as passed** (`fspx_code_sha256`, the key `create_compute`
+already resolves with). Stage blobs are kind 2 (compute layout blobs are kind 3): `+0x00` kind, `+0x04` size-12, `+0x08`
+and `+0x0C` undecoded words, 32-byte tagged records from `+0x10` (`0x41`/`0x42` like the compute blob), then a `0x43`
+word, the 16-byte source-container digest and exactly 12 zero bytes. **Stage identity is not in the blob** - it is the
+record slot (0 PS, 1 VS, 2 MS).
+
+Two gaps stand between this and a converter:
+
+1. `PipelineState::create_graphics` resolves stages only through `leonida::fssm_program`, so a native program is refused
+   with "shader bytecode holds no FSSM program"; the FSPX resolver is compute-only (`leonida::compute_program`). A native
+   branch that hashes the program and asks `library->fspx_candidates(stage, hash)` - the same key compute uses - is the
+   minimum runtime change, together with decoding the state blob and input-layout blob into the PC description (the
+   console record has no `D3D12_INPUT_ELEMENT_DESC` array and no fixed-function fields).
+2. The shader directory the boot loads carries only **61** `fspx_code_sha256` entries and **all are compute**; the
+   library's vs/ps/ms programs are not published there, so a graphics resolver has nothing to find yet. The
+   pipeline-library publication step must cover the graphics programs the title's records name, before the runtime change
+   can be measured.
+
+The state blob is undecoded and is the main unknown; the input-layout blob is partially decoded (element count at +0x4C,
+NUL-terminated semantics inline, 28 attribute bytes per element beginning with a format-sized code at +0x10). The
+measurements come from a reassembled library held outside the repository; nothing here quotes game data.

@@ -1,6 +1,6 @@
 {
   "updated": "2026-11-24",
-  "commit": "be9a2bc3f",
+  "commit": "HEAD",
   "intro": "Measured on one machine (Windows 11, Intel 13900K, RTX 4090) against a retail Xbox Series 1.0.2.1 package. Every row below is an outcome the project produces, not a plan; the commands that produce them are in the Build section, and the failures behind each number are in docs/boot_frontier.md.",
   "stages": [
     {
@@ -70,18 +70,22 @@
       "value": "10,242"
     },
     {
-      "what": "Console slot 57 stage pairs measured",
-      "value": "6 (VS, PS, DS, HS, GS and one more)"
+      "what": "Slot-57 calls per boot (deserialized graphics records)",
+      "value": "10,242"
+    },
+    {
+      "what": "Graphics programs matched from the extracted library",
+      "value": "2 verified by hash"
     }
   ],
   "frontier": {
     "stop": "game+0xcc2861",
-    "summary": "a read at 0x10 because a small container element is null: the title builds the container empty and reads its first element as an object pointer, and its own null check then reaches a compiler trap. The null traces back to a pipeline state the title never received: console device slot 57 is graphics PSO creation (measured from the call itself - IID_ID3D12PipelineState, a root signature and six native-code stage pairs), and forwarding it by slot number turned 10,242 of those calls into refused CreateLifetimeTracker calls.",
+    "summary": "a read at 0x10 because a small container element is null, and the null traces to pipeline states the title never received: console device slot 57 is a deserialized graphics pipeline record (measured - root signature, fixed-function state blob, input-layout blob, then native program and kind-2 stage-blob pairs in record order), whose programs hash-match the pipeline library already extracted. What is missing is a graphics-side resolver and the library's graphics programs in the shader index.",
     "detail_doc": "docs/boot_frontier.md"
   },
   "next": [
-    "implement console slot 57 as graphics PSO creation from native code, then re-measure the boot",
-    "follow what should populate the container whose first element is null",
+    "publish the pipeline library's graphics programs into the shader index (61 of its entries are in it today, all compute)",
+    "add a native-program branch to the graphics stage loop and decode the record's state and input-layout blobs",
     "refresh this block with `python -I tools/readme_progress.py` after each measured change"
   ],
   "links": [

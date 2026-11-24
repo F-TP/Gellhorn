@@ -60,6 +60,7 @@ extern "C" void leonida_register_console_heap(void* fn) {
 #include <iterator>
 #include <new>
 #include <memory>
+#include <string>
 #include <utility>
 
 namespace rt::d3d12_xs {
@@ -1723,15 +1724,25 @@ HRESULT proxy_create_compute_pipeline_state(DeviceProxy* self, const D3D12_COMPU
     return self->real->CreateComputePipelineState(desc, *riid, out);
 }
 
-// The Xbox slot 57 is the console's graphics PSO creation: the title passes a description in a1, the IID in a2 and the
-// out pointer in a3, and the descriptor's first words are a root signature followed by pointer/size shader pairs, i.e. a
-// D3D12_GRAPHICS_PIPELINE_STATE_DESC shape. The console's graphics description is not in the public GDK reference
-// (docs/xbox_d3d12_xs.md 5.3), so the layout is measured here rather than assumed: the first call dumps the descriptor's
-// words and the first four bytes of each of the five shader code pointers, which says whether the console passes DXBC or
-// native code and where each stage sits. Until the conversion is written the call refuses, as it did before.
+// The Xbox slot 57 is the console's precompiled graphics pipeline creation: the title passes the description in a1,
+// IID_ID3D12PipelineState in a2 and the out pointer in a3. The description is not a PC D3D12_GRAPHICS_PIPELINE_STATE_DESC
+// (the console's graphics description is not in the public GDK reference, docs/xbox_d3d12_xs.md 5.3): it is a root
+// signature followed by six pointer/size pairs, and the first call measures what those pairs are rather than assuming.
+// Measured: pairs 2 and 4 carry the FSPX kind-6 program prologue (docs/fspx.md, "Kind 6"), pairs 3 and 5 start with the
+// word 2 that docs/shader_library.md section 3 gives a graphics stage blob, and pairs 0 and 1 are the 388-byte state and
+// 188-byte input-layout blobs of a pipeline-library graphics record. So this is the graphics analogue of the compute
+// slot 67's DeserializeComputePipelineStateX: it creates a pipeline state from a precompiled record, with two
+// (program, stage blob) pairs in slot order (slot 0 the pixel shader, slot 1 the vertex shader). The probe logs per pair
+// the size, the prefix, whether it is a native kind-6 program whose SHA-256 the shader index keys it by, and for a blob
+// its tag offsets, digest and printable names, then refuses: no resolver for those records exists yet.
+// The trace line per call is not part of the conversion: this slot used to be forwarded to a PC method that recorded
+// one, and the boot's D3D12 call count is compared across trees, so the probe must record the call too.
 HRESULT proxy_create_graphics_pipeline_probe(DeviceProxy* self, const void* desc, const IID* riid, void** out) {
     (void)self;
     note_slot(57);
+    // Past the public device chain the slot has no PC name, so it is named by index, as a child slot past its chain is
+    // ("XboxID3D12CommandQueue::Slot40"); d3d12_trace::record takes a fixed string (runtime/README.md, [d3d12-trace]).
+    d3d12_trace::record("XboxID3D12Device::Slot57");
     if (!out) return E_POINTER;
     *out = nullptr;
     if (!desc) return E_INVALIDARG;
@@ -1746,25 +1757,87 @@ HRESULT proxy_create_graphics_pipeline_probe(DeviceProxy* self, const void* desc
                          static_cast<unsigned long long>(words[i]), static_cast<unsigned long long>(words[i + 1]),
                          static_cast<unsigned long long>(words[i + 2]), static_cast<unsigned long long>(words[i + 3]));
         }
-        // The five stage pairs a D3D12_GRAPHICS_PIPELINE_STATE_DESC puts at +0x08: VS, PS, DS, HS, GS.
-        for (int stage = 0; stage < 5; ++stage) {
-            const auto* pair = reinterpret_cast<const std::uint64_t*>(
-                static_cast<const std::uint8_t*>(desc) + 0x08 + 0x10 * static_cast<std::size_t>(stage));
-            const auto address = static_cast<std::uintptr_t>(pair[0]);
-            const std::uint64_t size = pair[1];
-            char head[5] = {0};
-            MEMORY_BASIC_INFORMATION mbi{};
-            const bool readable = address &&
-                                  VirtualQuery(reinterpret_cast<const void*>(address), &mbi, sizeof(mbi)) ==
-                                      sizeof(mbi) &&
-                                  mbi.State == MEM_COMMIT && !(mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD));
-            if (readable)
-                for (int b = 0; b < 4; ++b) head[b] = static_cast<char>(reinterpret_cast<const std::uint8_t*>(address)[b]);
-            std::fprintf(stderr, "[rt]   stage %d at +%02x: code %p size %llu first bytes %02x %02x %02x %02x (%s)\n",
-                         stage, 0x08 + 0x10 * stage, reinterpret_cast<void*>(address),
-                         static_cast<unsigned long long>(size), static_cast<unsigned char>(head[0]),
-                         static_cast<unsigned char>(head[1]), static_cast<unsigned char>(head[2]),
-                         static_cast<unsigned char>(head[3]), readable ? "readable" : "unreadable");
+        const auto* bytes = static_cast<const std::uint8_t*>(desc);
+        for (int pair = 0; pair < 6; ++pair) {
+            const std::size_t at = 0x08 + 0x10 * static_cast<std::size_t>(pair);
+            std::uint64_t address = 0;
+            std::uint64_t size = 0;
+            if (!readable_range(bytes + at, sizeof(address) + sizeof(size))) {
+                std::fprintf(stderr, "[rt]   pair %d at +%02x: description unreadable\n", pair, unsigned(at));
+                continue;
+            }
+            std::memcpy(&address, bytes + at, sizeof(address));
+            std::memcpy(&size, bytes + at + sizeof(address), sizeof(size));
+            const auto* code = reinterpret_cast<const std::uint8_t*>(address);
+            const bool readable = address && readable_range(code, 16);
+            char head[33] = {0};
+            for (int b = 0; readable && b < 16; ++b) std::snprintf(head + 2 * b, 3, "%02x", int(code[b]));
+            const char* tag = "none";
+            if (readable) {
+                if (std::memcmp(code, "FSSM", 4) == 0) tag = "FSSM";
+                else if (std::memcmp(code, "DXBC", 4) == 0) tag = "DXBC";
+                else if (std::memcmp(code, "FSPX", 4) == 0) tag = "FSPX";
+            }
+            bool prologue = false;
+            if (address && size >= 36 && readable_range(code, 36)) {
+                std::uint8_t first[36];
+                std::memcpy(first, code, sizeof(first));
+                prologue = leonida::fspx_bare_program({first, sizeof(first)});
+            }
+            const std::string sha =
+                address && size && size <= (16u << 20) && readable_range(code, static_cast<std::size_t>(size))
+                    ? leonida::sha256_hex({code, static_cast<std::size_t>(size)})
+                    : std::string();
+            std::fprintf(stderr,
+                         "[rt]   pair %d at +%02x: code %p size %llu first16 %s (tag %s, FSPX kind-6 prologue %s, "
+                         "sha256 %s)\n",
+                         pair, unsigned(at), reinterpret_cast<const void*>(address),
+                         static_cast<unsigned long long>(size), head, tag, prologue ? "yes" : "no",
+                         sha.empty() ? "unreadable" : sha.c_str());
+            if (!address || !size || size > 8192 || !readable_range(code, static_cast<std::size_t>(size))) continue;
+            const std::size_t length = static_cast<std::size_t>(size);
+            const std::size_t prefix_length = length < 64 ? length : 64;
+            char prefix[2 * 64 + 1] = {0};
+            for (std::size_t i = 0; i < prefix_length; ++i) std::snprintf(prefix + 2 * i, 3, "%02x", int(code[i]));
+            std::fprintf(stderr, "[rt]     pair %d first%zu: %s\n", pair, prefix_length, prefix);
+            // The 0x40/0x41/0x42/0x43 tags and the 16 bytes after the 0x43 word are what the stage and layout blobs of a
+            // pipeline-library record are made of (docs/shader_library.md section 3): logging their offsets and the
+            // digest is enough to write a reader without dumping the blob.
+            std::string tags;
+            char entry[32] = {0};
+            for (std::size_t where = 0; where + 4 <= length && tags.size() < 480; where += 4) {
+                std::uint32_t word = 0;
+                std::memcpy(&word, code + where, 4);
+                if (word != 0x40 && word != 0x41 && word != 0x42 && word != 0x43 && word != 0x403) continue;
+                std::snprintf(entry, sizeof(entry), "%s0x%x@+0x%zx", tags.empty() ? "" : ", ", unsigned(word), where);
+                tags += entry;
+            }
+            std::string digest;
+            for (std::size_t where = 0; where + 20 <= length; where += 4) {
+                std::uint32_t word = 0;
+                std::memcpy(&word, code + where, 4);
+                if (word != 0x43) continue;
+                char hex[33] = {0};
+                for (int b = 0; b < 16; ++b) std::snprintf(hex + 2 * b, 3, "%02x", int(code[where + 4 + b]));
+                digest = hex;
+                break;
+            }
+            std::size_t zero_tail = 0;
+            while (zero_tail < length && code[length - 1 - zero_tail] == 0) ++zero_tail;
+            // An input layout names its semantics, so any printable run of four or more bytes is worth reporting.
+            std::string names;
+            for (std::size_t where = 0; where + 4 <= length && names.size() < 240; ++where) {
+                if (code[where] < 0x20 || code[where] > 0x7e) continue;
+                std::size_t end = where;
+                while (end < length && code[end] >= 0x20 && code[end] <= 0x7e && end - where < 32) ++end;
+                if (end - where < 4) continue;
+                names.append(names.empty() ? "" : ",");
+                names.append(reinterpret_cast<const char*>(code + where), end - where);
+                where = end;
+            }
+            std::fprintf(stderr, "[rt]     pair %d structure: tags [%s] digest16 %s trailing_zeros %zu ascii [%s]\n", pair,
+                         tags.empty() ? "none" : tags.c_str(), digest.empty() ? "none" : digest.c_str(), zero_tail,
+                         names.empty() ? "none" : names.c_str());
         }
     }
     return E_NOTIMPL;
