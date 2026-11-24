@@ -1,6 +1,7 @@
 // Xbox-ABI queue and fence proxies (d3d12_xs_device.h) over synthetic COM objects, with no D3D12 runtime and no GPU:
 //   - devices that stop at ID3D12Device, Device1, Device3 and Device9: the slots of a missing interface (45/46,
-//     50, 75) are refused without reaching the device, the others get the real objects behind the proxies;
+//     50, 75) are past the PC table and stubbed with S_OK / 0 without reaching the device, the others get the real
+//     objects behind the proxies;
 //   - fences with and without ID3D12Fence1: 11 or 12 public slots, QueryInterface and slot 11 to match;
 //   - creation that fails, that returns S_OK with no object, a null IID or output, and an interface the real object
 //     has but the proxy does not model;
@@ -77,6 +78,10 @@ constexpr std::uint64_t kFenceHandle = 0x1000, kResourceHandle = 0x2000;  // the
 constexpr std::uint64_t kCompletedValue = 7;                            // what a mock fence's slot 8 returns
 // {5d1e0c4a-2b7f-4e61-9a3d-8c4b2f1e6a70}: an interface the mock queue implements that the proxy does not model.
 constexpr GUID kExtraIid{0x5d1e0c4a, 0x2b7f, 0x4e61, {0x9a, 0x3d, 0x8c, 0x4b, 0x2f, 0x1e, 0x6a, 0x70}};
+// What the mock real queue's GetDesc answers: synthetic values, non-zero in every field, so a stale title buffer (the
+// old forwarding left it untouched) or a descriptor written in the wrong place cannot match it by accident.
+constexpr D3D12_COMMAND_QUEUE_DESC kMockQueueDesc{D3D12_COMMAND_LIST_TYPE_COPY, 0x1d2c,
+                                                  D3D12_COMMAND_QUEUE_FLAG_DISABLE_GPU_TIMEOUT, 0x5a};
 
 struct Mock {
     void** vtable;
@@ -92,6 +97,18 @@ struct Mock {
     unsigned calls[kMockSlots];
     std::uint64_t args[kMockSlots][5];
     std::uint64_t array[kMockSlots][4];  // device: the first entries of the array argument, as received
+    // Queue slot 18 (GetDesc): the two arguments the real method was called with, as the proxy's conversion passed
+    // them. The test compares them with the pointers it knows: the hidden buffer must be the title's, the object the
+    // mock queue itself.
+    std::uint64_t get_desc_hidden;
+    std::uint64_t get_desc_self;
+    // Device slot 8 (CreateCommandQueue): the description the PC method was handed. It is the proxy's own copy, not
+    // the title's pointer (slot 48 copies the 16-byte console prefix and masks its Flags), so the test reads the
+    // contents rather than the pointer's identity.
+    D3D12_COMMAND_QUEUE_DESC queue_desc;
+    // Device slot 12 (CreateCommandList): the IID the PC method was asked for, by value. Slot 73 asks the host for the
+    // base GraphicsCommandList interface and passes its own copy of the title's IID, so the pointer is not the title's.
+    GUID list_iid;
 };
 
 Mock g_pool[256];
@@ -199,7 +216,9 @@ std::uint64_t mock_call(Mock* m, unsigned slot, const std::uint64_t* words) {
     const std::uint64_t a1 = words[0], a2 = words[1], a3 = words[2], a4 = words[3];
     if (m->kind == Kind::device) {
         switch (slot) {
-            case 8: return static_cast<std::uint32_t>(mock_create(m, Kind::queue, a2, a3));    // CreateCommandQueue
+            case 8:  // CreateCommandQueue(desc, riid, out)
+                if (a1) std::memcpy(&m->queue_desc, reinterpret_cast<const void*>(a1), sizeof(m->queue_desc));
+                return static_cast<std::uint32_t>(mock_create(m, Kind::queue, a2, a3));
             case 9: return static_cast<std::uint32_t>(mock_create(m, Kind::allocator, a2, a3));  // CreateCmdAllocator
             case 14: return static_cast<std::uint32_t>(mock_create(m, Kind::heap, a2, a3));       // CreateDescriptorHeap
             case 75: return static_cast<std::uint32_t>(mock_create(m, Kind::queue, a3, a4));   // CreateCommandQueue1
@@ -254,6 +273,7 @@ HRESULT WINAPI mock_create_command_list(Mock* self, std::uint64_t node_mask, std
     self->args[12][2] = allocator;
     self->args[12][3] = initial_state;
     self->args[12][4] = reinterpret_cast<std::uint64_t>(riid);
+    if (riid) self->list_iid = *riid;  // by value: the proxy's PC IID is a copy, not the title's pointer
     if (!out) return S_FALSE;
     *out = nullptr;
     if (self->create_null || FAILED(self->create_result)) return self->create_result;
@@ -261,6 +281,19 @@ HRESULT WINAPI mock_create_command_list(Mock* self, std::uint64_t node_mask, std
     child->list_level = self->list_level;
     self->last_child = child;
     return mock_query(child, riid, out);
+}
+
+// PC ID3D12CommandQueue::GetDesc returns D3D12_COMMAND_QUEUE_DESC by value, so MSVC's convention hands that method the
+// hidden return buffer in RCX and the object in RDX - the opposite of the title's (queue, buffer) call, which is why
+// the proxy has a conversion for slot 18 (measured: forwarded the generic way, the descriptor went into the front of
+// the real queue object and the title kept reading its old buffer). This mock is the "real" method: it records the two
+// pointers it was called with and writes the descriptor to the hidden buffer, as the PC method would.
+void WINAPI mock_queue_get_desc(void* hidden, void* object) {
+    auto* const self = reinterpret_cast<Mock*>(object);
+    ++self->calls[18];
+    self->get_desc_hidden = reinterpret_cast<std::uint64_t>(hidden);
+    self->get_desc_self = reinterpret_cast<std::uint64_t>(object);
+    std::memcpy(hidden, &kMockQueueDesc, sizeof(kMockQueueDesc));
 }
 
 template <std::size_t... I>
@@ -273,6 +306,7 @@ void** mock_vtable() {
     static const bool filled = [] {
         fill_mock_vtable(table, std::make_index_sequence<kMockSlots>{});
         table[12] = reinterpret_cast<void*>(&mock_create_command_list);
+        table[18] = reinterpret_cast<void*>(&mock_queue_get_desc);  // the struct-returning GetDesc, not the generic thunk
         return true;
     }();
     (void)filled;
@@ -368,7 +402,9 @@ int check_levels() {
         EXPECT(hr_of(raw(device, 31, word(fence), 0, GENERIC_ALL, 0, 0)) == S_OK);
         EXPECT(mock->calls[31] == 1 && mock->args[31][0] == real_fence);
 
-        // 45/46: ID3D12Device1
+        // 45/46: ID3D12Device1. A device without that interface has no PC entry there, so the slot is past its table:
+        // the proxy stubs it with S_OK / 0 and never reaches the device (measured: refusing slots past the PC table
+        // aborted the retail title - it calls slot 127 from 45 sites - so every one of them is stubbed and logged).
         const HRESULT r45 = hr_of(raw(device, 45, word(fences), word(values), 2, 0, 0));
         const HRESULT r46 = hr_of(raw(device, 46, 4, word(objects), word(priorities)));
         if (l.level >= 1) {
@@ -376,26 +412,27 @@ int check_levels() {
                    mock->array[45][1] == real_fence);
             EXPECT(r46 == S_OK && mock->calls[46] == 1 && same(mock->array[46], unwrapped, 4));
         } else {
-            EXPECT(r45 == E_NOTIMPL && r46 == E_NOTIMPL && mock->calls[45] == 0 && mock->calls[46] == 0);
+            EXPECT(r45 == S_OK && r46 == S_OK && mock->calls[45] == 0 && mock->calls[46] == 0);
             void* device1 = nullptr;
             EXPECT(FAILED(hr_of(raw(device, 0, word(&kDevice1Iid), word(&device1)))) && !device1);
         }
-        // 50: ID3D12Device3, with the fence argument unwrapped too
+        // 50: ID3D12Device3, with the fence argument unwrapped too. Past the table: stubbed like 45/46.
         const HRESULT r50 = hr_of(raw(device, 50, 0, 4, word(objects), word(fence), 1));
         if (l.level >= 3) {
             EXPECT(r50 == S_OK && mock->calls[50] == 1 && same(mock->array[50], unwrapped, 4) &&
                    mock->args[50][3] == real_fence);
         } else {
-            EXPECT(r50 == E_NOTIMPL && mock->calls[50] == 0);
+            EXPECT(r50 == S_OK && mock->calls[50] == 0);
         }
-        // 75: ID3D12Device9::CreateCommandQueue1
+        // 75: ID3D12Device9::CreateCommandQueue1 - past the table on a device that predates Device9, so the stub answers
+        // S_OK with the output still cleared and the device's own slot 75 never reached.
         void* queue1 = reinterpret_cast<void*>(1);  // cleared on every failure (bc59ef46's convention)
         const HRESULT r75 = hr_of(raw(device, 75, word(&kQueueDesc), 0, word(&kQueueIid), word(&queue1)));
         if (l.level >= 9) {
             EXPECT(r75 == S_OK && xs::is_queue_proxy(queue1) && mock->calls[75] == 1);
             EXPECT(release(queue1) == 0 && mock->last_child->refs == 0);
         } else {
-            EXPECT(r75 == E_NOTIMPL && !queue1 && mock->calls[75] == 0);
+            EXPECT(r75 == S_OK && !queue1 && mock->calls[75] == 0);
         }
 
         // 133: past every PC device vtable; the retail title calls it. Refused, not a jump through a missing entry.
@@ -509,8 +546,8 @@ int check_levels() {
         EXPECT(queue_mock->refs == 0 && fence_mock->refs == 0);
         EXPECT(release(device) == 0 && mock->refs == 0);
     }
-    std::printf("%s: devices up to ID3D12Device, Device1, Device3, Device9: 44/47/51/76 slots, 45/46/50/75 refused "
-                "without the interface, residency arrays and fences unwrapped otherwise\n", g_label);
+    std::printf("%s: devices up to ID3D12Device, Device1, Device3, Device9: 44/47/51/76 slots, 45/46/50/75 stubbed "
+                "past the table without reaching the device, residency arrays and fences unwrapped otherwise\n", g_label);
     return 0;
 }
 
@@ -836,11 +873,23 @@ int check_xbox_slots() {
     EXPECT(hr_of(raw(device, 80, 0, 0, 0, 0, 0)) == E_POINTER);
     EXPECT(mock->calls[80] == 0 && xs::device_slot_hits(80) == 3);
 
-    // 48 CreateCommandQueueX(desc, riid, out): the queue proxy, created through the PC slot 8 path.
+    // 48 CreateCommandQueueX(desc, riid, out): the queue proxy, created through the PC slot 8 path. The console
+    // description starts with a PC D3D12_COMMAND_QUEUE_DESC and carries console Flags bits the host refuses, so the
+    // proxy copies the 16-byte prefix and masks Flags to the one PC bit (measured: the unmasked bits are what
+    // "CreateCommandQueue refused (type, priority, flags or node mask)" reported). The real slot 8 therefore sees the
+    // proxy's copy - the same type, priority and node mask, Flags 0x201 -> 0x1 - not the title's pointer.
+    D3D12_COMMAND_QUEUE_DESC xbox_queue_desc{};
+    xbox_queue_desc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    xbox_queue_desc.Priority = 0x11;
+    xbox_queue_desc.Flags = static_cast<D3D12_COMMAND_QUEUE_FLAGS>(0x201);
+    xbox_queue_desc.NodeMask = 3;
     void* queue = nullptr;
-    EXPECT(hr_of(raw(device, 48, word(&kQueueDesc), word(&kQueueIid), word(&queue))) == S_OK);
+    EXPECT(hr_of(raw(device, 48, word(&xbox_queue_desc), word(&kQueueIid), word(&queue))) == S_OK);
     EXPECT(xs::is_queue_proxy(queue) && mock->calls[48] == 0 && mock->calls[8] == 1);
-    EXPECT(mock->args[8][0] == word(&kQueueDesc));
+    EXPECT(mock->queue_desc.Type == D3D12_COMMAND_LIST_TYPE_DIRECT && mock->queue_desc.Priority == 0x11);
+    EXPECT(static_cast<std::uint32_t>(mock->queue_desc.Flags) ==
+           static_cast<std::uint32_t>(D3D12_COMMAND_QUEUE_FLAG_DISABLE_GPU_TIMEOUT));
+    EXPECT(mock->queue_desc.NodeMask == 3);
 
     // 73 CreateCommandListX(desc, allocator, initialState, riid, out): the type is desc's first word, the allocator
     // proxy is unwrapped, the node mask is 0 and the PC six-argument CreateCommandList (slot 12) is reached.
@@ -865,7 +914,11 @@ int check_xbox_slots() {
     EXPECT(mock->calls[73] == 0 && mock->calls[12] == 1 && xs::device_slot_hits(73) == 1);
     EXPECT(mock->args[12][0] == 0 && mock->args[12][1] == D3D12_COMMAND_LIST_TYPE_DIRECT);
     EXPECT(mock->args[12][2] == word(real_allocator) && mock->args[12][3] == 0);
-    EXPECT(mock->args[12][4] == word(&list_iid));
+    // The PC list is created as a member with the proxy's own IID copy: the base GraphicsCommandList for the console
+    // IID (measured: the PC SDK does not declare the console one, so asking for it returned E_NOINTERFACE and the
+    // title asserted on a null list), or the title's PC IID unchanged. The pointer the real slot 12 receives is
+    // therefore never the title's; the test compares the value it asked for.
+    EXPECT(IsEqualIID(mock->list_iid, list_iid));
 
     // Release the list before the refusal calls below: the COM convention (and the handler) nulls the caller's
     // output on failure, so an invalid call would clear this pointer.
@@ -937,7 +990,11 @@ int run_env_slots(bool valid) {
         EXPECT(hr_of(raw(device, 78, 0, 16667, 1, 0)) == S_OK && mock->calls[78] == 0);
         EXPECT(hr_of(raw(device, 79, 0, 0, 0, 0)) == S_OK && mock->calls[79] == 0);
         EXPECT(hr_of(raw(device, 80, 0, 0, 0, 0, word(&token))) == S_OK && token && mock->calls[80] == 0);
-        EXPECT(hr_of(raw(device, 70)) == S_OK && mock->calls[70] == 1);  // not an Xbox slot: forwarded
+        // 70 is measured as a console slot now: the title's thunk calls it with three arguments, so the proxy refuses
+        // it (measured by console-measured arity) instead of forwarding it to the PC CreatePlacedResource1. The
+        // forwarded-slot check therefore uses 74: inside the 80-slot PC vtable and not a slot the proxy overrides.
+        EXPECT(hr_of(raw(device, 70)) == E_NOTIMPL && mock->calls[70] == 0);
+        EXPECT(hr_of(raw(device, 74)) == S_OK && mock->calls[74] == 1);  // not an Xbox slot: forwarded unchanged
     }
     EXPECT(release(device) == 0 && mock->refs == 0);
     std::printf("%s: environment slot overrides %s\n", g_label,
@@ -959,11 +1016,81 @@ int check_tail(bool want_guarded) {
     // Signal (14) still reaches the real queue, with the real fence.
     EXPECT(hr_of(raw(queue, 14, word(fence), 5)) == S_OK && queue_mock->calls[14] == 1 &&
            queue_mock->args[14][0] == word(xs::fence_proxy_real_fence(fence)) && queue_mock->args[14][1] == 5);
-    for (unsigned slot = 19; slot < xs::queue_proxy_table_size(); ++slot)
+    // Slot 35 is no longer part of the refused tail: the title calls it at two measured sites as (this, arg, pair*),
+    // and the proxy answers a clock calibration pair instead of E_NOTIMPL (check_queue_console_slots checks the pair
+    // itself). The rest of the tail keeps the refused behaviour, and never reaches the real queue.
+    for (unsigned slot = 19; slot < xs::queue_proxy_table_size(); ++slot) {
+        if (slot == 35) continue;
         EXPECT(hr_of(raw(queue, slot)) == E_NOTIMPL && queue_mock->calls[slot] == 0);
+    }
+    EXPECT(hr_of(raw(queue, 35)) == S_OK && queue_mock->calls[35] == 0);
     for (unsigned slot = 12; slot < xs::fence_proxy_table_size(); ++slot) EXPECT(hr_of(raw(fence, slot)) == E_NOTIMPL);
     EXPECT(xs::queue_table_overruns() == 0 && xs::fence_table_overruns() == 0);
     EXPECT(release(queue) == 0 && release(fence) == 0 && release(device) == 0 && mock->refs == 0);
+    return 0;
+}
+
+// ---- 10. Queue slot 18 (GetDesc) and slot 35 (the console calibration pair) ----
+
+int check_queue_console_slots() {
+    Mock* mock = nullptr;
+    void* device = make_device(mock, 9, true);
+    EXPECT(device);
+    void* queue = make_queue(device);
+    EXPECT(xs::is_queue_proxy(queue) && xs::queue_proxy_slot_count(queue) == 19);
+    Mock* const real_queue = reinterpret_cast<Mock*>(xs::queue_proxy_real_queue(queue));
+    EXPECT(real_queue && real_queue->kind == Kind::queue);
+    xs::reset_device_proxy_stats();
+
+    // Slot 18, GetDesc. Measured: the title calls it as (queue in RCX, buffer in RDX), while our real queue is a C++
+    // object whose GetDesc returns D3D12_COMMAND_QUEUE_DESC by value, so MSVC's method takes the hidden return buffer
+    // in RCX and the object in RDX. Forwarded through the generic path the descriptor landed in the front of the real
+    // queue object and the title's buffer kept its old contents (measured: the title read 1 << 32 from it and faulted
+    // on 0x100000000), so the proxy must swap the two.
+    alignas(16) std::uint8_t buffer[sizeof(D3D12_COMMAND_QUEUE_DESC)];
+    std::memset(buffer, 0xcd, sizeof(buffer));  // a stale buffer, not a descriptor
+    std::uint8_t front_before[16], front_after[16];
+    std::memcpy(front_before, real_queue, sizeof(front_before));
+    real_queue->get_desc_hidden = real_queue->get_desc_self = 0;
+    EXPECT(hr_of(raw(queue, 18, word(buffer))) == S_OK);
+    std::memcpy(front_after, real_queue, sizeof(front_after));
+    EXPECT(xs::queue_slot_hits(18) == 1 && real_queue->calls[18] == 1);
+    // (a) the hidden return pointer is the buffer the title passed in RDX...
+    EXPECT(real_queue->get_desc_hidden == word(buffer));
+    // (b) ...and the object pointer is the mock real queue, not the title's buffer.
+    EXPECT(real_queue->get_desc_self == word(real_queue));
+    // (c) the 16-byte descriptor lands in the title's buffer.
+    EXPECT(std::memcmp(buffer, &kMockQueueDesc, sizeof(kMockQueueDesc)) == 0);
+    // (d) the real queue object's own first 16 bytes are untouched (the old order wrote the descriptor there).
+    EXPECT(std::memcmp(front_before, front_after, sizeof(front_before)) == 0);
+
+    // Slot 35, a console extension past the PC table. Measured at two call sites: (this, arg, pair*), where the caller
+    // reads two 64-bit values back from the third argument's pointer (one site passes a global). The proxy answers a
+    // calibration pair - the host counter, the same value in both halves - and only writes a range VirtualQuery sees as
+    // committed and writable. The old E_NOTIMPL left those words as the caller's stack garbage, which it later used as
+    // a pointer.
+    std::uint64_t pair[2] = {0x11, 0x22};
+    EXPECT(hr_of(raw(queue, 35, 0, word(pair))) == S_OK);
+    EXPECT(pair[0] != 0 && pair[0] == pair[1]);
+    // A null out pointer: S_OK, no write, no fault.
+    EXPECT(hr_of(raw(queue, 35)) == S_OK);
+    // A committed but read-only page: reported as not writable, so it is neither written nor faulted on.
+    auto* const read_only = static_cast<std::uint64_t*>(
+        VirtualAlloc(nullptr, 0x1000, MEM_COMMIT | MEM_RESERVE, PAGE_READONLY));
+    EXPECT(read_only != nullptr);
+    EXPECT(read_only[0] == 0 && read_only[1] == 0);  // fresh pages are zero, so a write would show
+    EXPECT(hr_of(raw(queue, 35, 0, word(read_only))) == S_OK);
+    EXPECT(read_only[0] == 0 && read_only[1] == 0);
+    EXPECT(VirtualFree(read_only, 0, MEM_RELEASE) != FALSE);
+    // An address no committed range backs: VirtualQuery fails, and the slot still answers S_OK without writing.
+    EXPECT(hr_of(raw(queue, 35, 0, 0x10)) == S_OK);
+    EXPECT(xs::queue_slot_hits(35) == 4 && real_queue->calls[35] == 0);  // answered by the proxy, never forwarded
+
+    EXPECT(release(queue) == 0 && real_queue->refs == 0);
+    EXPECT(release(device) == 0 && mock->refs == 0);
+    std::printf("%s: queue slot 18 converts GetDesc's console struct-return order (the title's buffer gets the "
+                "descriptor, the real queue is the object, its front words untouched) and slot 35 answers a calibration "
+                "pair when the out pointer is writable and S_OK without writing otherwise\n", g_label);
     return 0;
 }
 
@@ -1248,8 +1375,9 @@ int main(int argc, char** argv) {
         return run_fault_mode(argv[1]);
     }
     if (argc != 1) return 2;
-    if (check_tail(true) || check_levels() || check_fence1() || check_create_failures() || check_open_shared() ||
-        check_alloc_failures() || check_allocators() || check_xbox_slots() || check_console_command_list())
+    if (check_tail(true) || check_queue_console_slots() || check_levels() || check_fence1() ||
+        check_create_failures() || check_open_shared() || check_alloc_failures() || check_allocators() ||
+        check_xbox_slots() || check_console_command_list())
         return 1;
     std::printf("xs_proxy_mock_test: PASS (%d allocations refused on purpose)\n", g_failed_news);
     return 0;
