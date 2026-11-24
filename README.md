@@ -39,7 +39,8 @@ clean-room approach, plus the boot fixes measured on this machine.
 | FidelityFX pipeline programs translated | 29 / 29 |
 | Refused graphics pipeline creations (console slot 57, before the conversion) | 10,242 |
 | Slot-57 calls per boot (deserialized graphics records) | 10,242 |
-| Graphics programs matched from the extracted library | 2 verified by hash |
+| Distinct slot-57 records a boot asks for | 9,943 |
+| Distinct graphics programs behind them | 1,264 (945 PS, 319 VS) |
 
 **Where it stops now:** `game+0xcc2861` - a read at 0x10 because a small container element is null, and the null traces to pipeline states the title never received: console device slot 57 is a deserialized graphics pipeline record (measured - root signature, fixed-function state blob, input-layout blob, then native program and kind-2 stage-blob pairs in record order), whose programs hash-match the pipeline library already extracted. What is missing is a graphics-side resolver and the library's graphics programs in the shader index.
 Measurements and the method behind them: [docs/boot_frontier.md](docs/boot_frontier.md).

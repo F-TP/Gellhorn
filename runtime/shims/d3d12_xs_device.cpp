@@ -58,6 +58,8 @@ extern "C" void leonida_register_console_heap(void* fn) {
 #include <cstdlib>
 #include <cstring>
 #include <iterator>
+#include <set>
+#include <mutex>
 #include <new>
 #include <memory>
 #include <string>
@@ -1747,6 +1749,58 @@ HRESULT proxy_create_graphics_pipeline_probe(DeviceProxy* self, const void* desc
     *out = nullptr;
     if (!desc) return E_INVALIDARG;
     if (!riid) return E_POINTER;
+    // How many distinct records a boot asks for, and of which shape: each descriptor's six pointer/size pairs and the
+    // first words of its state and input-layout blobs, once per distinct descriptor. This sizes the work that has to be
+    // published and translated before a resolver can find anything: it is the number of graphics pipelines the title
+    // needs at this point in the boot, not the number of calls.
+    {
+        const auto* bytes = static_cast<const std::uint8_t*>(desc);
+        std::uint64_t digest = 0xcbf29ce484222325ull;
+        for (int i = 0; i < 0x68; ++i) digest = (digest ^ bytes[i]) * 0x100000001b3ull;
+        static std::mutex record_mutex;
+        static std::set<std::uint64_t> seen_records;
+        bool first_time = false;
+        {
+            const std::lock_guard lock(record_mutex);
+            first_time = seen_records.insert(digest).second;
+        }
+        if (first_time) {
+            const auto* words = reinterpret_cast<const std::uint64_t*>(desc);
+            std::fprintf(stderr, "[rt] d3d12_xs: slot 57 record %016llx: root %p, pairs",
+                         static_cast<unsigned long long>(digest), reinterpret_cast<void*>(words[0]));
+            const std::uint64_t sizes[6] = {words[2], words[4], words[6], words[8], words[10], words[12]};
+            for (int i = 0; i < 6; ++i) std::fprintf(stderr, " %llu", static_cast<unsigned long long>(sizes[i]));
+            std::uint32_t state_word = 0, layout_word = 0;
+            if (readable_range(reinterpret_cast<const void*>(words[1]), 4))
+                state_word = *reinterpret_cast<const std::uint32_t*>(words[1]);
+            if (readable_range(reinterpret_cast<const void*>(words[3]), 8))
+                layout_word = *reinterpret_cast<const std::uint32_t*>(words[3]);
+            std::fprintf(stderr, "; state[0] %08x layout[0] %08x\n", state_word, layout_word);
+            // The records differ mostly in state and input layout, so the translation job is sized by distinct programs,
+            // not by records. Pairs 2 and 4 carry the program bytes (a size and an FNV over the first 512 bytes identify
+            // one well enough to count; SHA-256 is the key the index actually uses).
+            for (int slot = 0; slot < 2; ++slot) {
+                const int pair = 2 + 2 * slot;
+                const std::uint64_t address = words[2 * pair + 1];
+                const std::uint64_t size = words[2 * pair + 2];
+                if (!address || !size || !readable_range(reinterpret_cast<const void*>(address), 1)) continue;
+                std::uint64_t digest = 0xcbf29ce484222325ull;
+                const auto* code = reinterpret_cast<const std::uint8_t*>(address);
+                const std::uint64_t covered = size < 512 ? size : 512;
+                for (std::uint64_t i = 0; i < covered; ++i) digest = (digest ^ code[i]) * 0x100000001b3ull;
+                static std::mutex program_mutex;
+                static std::set<std::pair<std::uint64_t, std::uint64_t>> seen_programs[2];
+                bool first_program = false;
+                {
+                    const std::lock_guard lock(program_mutex);
+                    first_program = seen_programs[slot].insert({size, digest}).second;
+                }
+                if (first_program)
+                    std::fprintf(stderr, "[rt] d3d12_xs: slot 57 program %d: %llu B fnv %016llx\n", slot,
+                                 static_cast<unsigned long long>(size), static_cast<unsigned long long>(digest));
+            }
+        }
+    }
     static std::atomic<bool> logged{false};
     if (!logged.exchange(true, std::memory_order_relaxed)) {
         const auto* words = static_cast<const std::uint64_t*>(desc);

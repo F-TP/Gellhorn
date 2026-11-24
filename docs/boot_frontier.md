@@ -436,6 +436,10 @@ Two gaps stand between this and a converter:
    pipeline-library publication step must cover the graphics programs the title's records name, before the runtime change
    can be measured.
 
+Measured sizes of the job, from the same boot: the title asks for **9,943 distinct records** but only **1,264 distinct
+graphics programs** (945 PS, 319 VS). Records differ in their state and input-layout blobs, not in their code, so
+publishing the programs is a bounded task - roughly the size of the compute set that was translated before.
+
 The state blob is undecoded and is the main unknown; the input-layout blob is partially decoded (element count at +0x4C,
 NUL-terminated semantics inline, 28 attribute bytes per element beginning with a format-sized code at +0x10). The
 measurements come from a reassembled library held outside the repository; nothing here quotes game data.
