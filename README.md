@@ -43,16 +43,16 @@ clean-room approach, plus the boot fixes measured on this machine.
 | Stand-in effect on the stop | none (same instruction, same null) |
 | A8 render-target formats refused | 0 (was 1 per factory call) |
 | Retail boot result | ALIVE; frames submitted, none presented |
-| Close calls succeeding with the lifecycle (two invalid calls muted, 60 s) | 57,597 of 57,597 |
-| Frame submits in the same 60 s run | 56,983 |
+| Frame recording (converted, no mutes, 60 s) | 30,999 closes OK / 0 failed, 30,376 submits |
+| Graphics PSO backend tests | 128 checks |
 
-**Where it stops now:** `none - the title runs and submits frames (ALIVE, 78,745 submits per 140 s)` - the frame's recording now works: the list proxy reopens a closed list against its allocator before recording, which measured 57,597 successful closes and 56,983 submits in a 60 s run once two invalid console recording calls were muted. Those two - the console ClearRenderTargetView (slot 52) and the console barrier (slot 146) - and the still refused slot-57 pipeline records are what stand between the frame and its first draw.
+**Where it stops now:** `none - the title runs and submits frames (ALIVE, 78,745 submits per 140 s)` - the frame's recording is now fully honest: no mutes, 30,999 successful closes, 30,376 recorded frames submitted, barriers and the null-target clear converted (docs/handles_barriers.md). The draw path is the frontier: no draw or pipeline state is ever recorded because the frame clears a null render target, and the slot-57 pipeline records - for which the backend now exists (docs/graphics_pso.md) - are not wired yet and would refuse input layouts with elements until their format codes are decoded.
 Measurements and the method behind them: [docs/boot_frontier.md](docs/boot_frontier.md).
 
 Next up:
-- map console ClearRenderTargetView (list slot 52) onto the PC target view the capture expects
-- translate the console barrier (list slot 146) into the PC barrier the runtime accepts
-- convert the slot-57 graphics records into real pipelines so the renderer has draws to record
+- wire slot-57 records through the new graphics_pso backend and measure which field refuses the most records
+- decode the input-layout format codes (the builder refuses any layout with elements today)
+- find why the frame's render-target view is null - what should create the real target
 - wire PresentX for real once the frame has content
 
 More: [the full measurement ladder](docs/boot_frontier.md), [the null-object chain trace](docs/null_object_chain.md), [how the other public attempt is built](docs/competitor_intel.md), [incoming reports and tracked findings](docs/issues.md).

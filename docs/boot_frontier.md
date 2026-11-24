@@ -648,3 +648,38 @@ console `ClearRenderTargetView` (slot 52) must map the console CPU descriptor ha
 expects, and the console barrier (slot 146) must translate its 64-byte texture group (which can carry `pResource = 0`)
 into the PC barrier the runtime accepts. No draw is recorded yet either way, which is expected: the graphics pipeline
 records (device slot 57) are still refused, so the renderer has no pipeline state to draw with.
+
+
+## Frontier 2026-11-24 (recording converted end to end; the draw path is the frontier)
+
+Both invalid recording calls are now real conversions, verified with **no mutes**: a 60 s boot shows **30,999 Close
+S_OK / 0 failed**, 30,376 list reopens and 30,376 submits, ALIVE with no exception (docs/handles_barriers.md). The frame
+rate is roughly half the muted control (54,647 submits) because each frame now really carries ~2.5 barriers instead of the
+call being dropped - no submission is lost.
+
+* Console `ClearRenderTargetView` (list slot 52): the handle is not a console address needing a mapping; it is a CPU
+  descriptor handle this proxy's own `CreateRenderTargetView` created **from a null resource**, so the clear is the no-op
+  the console intends. A clear whose capture is a real view forwards unchanged; a null-view clear is answered as a no-op
+  and never forwarded; an unreadable or emptied capture is refused with a named log.
+* Console barrier (list slot 146): groups are PC-shaped. A resource-less texture entry becomes a `D3D12_GLOBAL_BARRIER`
+  with the same sync/access words (layouts have no PC encoding without a resource and are logged once); real-resource
+  entries pass through as texture barriers; unmeasured shapes are refused, never forwarded. Each refusal answers 0, so the
+  list stays valid and the frame keeps its Close.
+
+The graphics pipeline backend is ready too (docs/graphics_pso.md): `create_graphics` now resolves native (FSPX kind-6)
+stages through `rt::graphics_pso::resolve_native_stage` with the same key `create_compute` uses - including the published
+raw-key entries - and refuses ambiguity with the SHA-256 named; and `rt::graphics_pso::build` turns a decoded slot-57
+record plus explicit caller inputs into a PC `D3D12_GRAPHICS_PIPELINE_STATE_DESC`. `graphics_pso_test` covers 128 checks.
+
+What still stands between this and a drawn frame, in measured order:
+
+1. **The draw path is never reached**: `SetPipelineState` and every draw call remain 0, and the frame clears a **null**
+   render-target view the title itself created. Before slot 57 can produce the draw's pipeline, the frame has to have a
+   real target to draw into.
+2. **The slot-57 wiring** (next): the backend exists but the proxy still refuses the records. The documented wiring is in
+   docs/graphics_pso.md section 5; it needs explicit attachment formats and the documented default state, because the
+   record carries neither. The builder refuses any input layout with elements (format codes unmapped so far), and the
+   library's vertex pipelines carry elements - so expect the first measurement to refuse most records with a named field,
+   which is the next thing to decode.
+3. **PresentX** (queue slot 32) is still refused; the prepared presenter is in xbox_present.* and the frame currently has
+   only a null-target clear to present.
