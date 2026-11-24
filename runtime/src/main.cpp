@@ -23,6 +23,7 @@
 #include <exception>
 #include <filesystem>
 #include <chrono>
+#include <intrin.h>
 #include <map>
 #include <thread>
 #include <string>
@@ -303,6 +304,49 @@ int wmain(int argc, wchar_t** argv) {
                 std::fprintf(stderr, "[rt] could not seed image+0x%llx (error %lu)\n",
                              static_cast<unsigned long long>(rva), GetLastError());
             }
+        }
+        // LEONIDA_TEB_CHECK=1 validates the TEB offsets the loader's TLS rewrite depends on, from host code: allocate a
+        // TlsAlloc slot, store a marker in it, then read it back the way the rewritten guest code does. If the offsets do
+        // not agree, every TLS read the rewrite produces is wrong, which no amount of guest-side logging can show.
+        if (std::getenv("LEONIDA_TEB_CHECK")) {
+            void* const marker = reinterpret_cast<void*>(static_cast<std::uintptr_t>(0x1122334455667788ull));
+            const DWORD slot = TlsAlloc();
+            const bool stored = slot != TLS_OUT_OF_INDEXES && TlsSetValue(slot, marker) != FALSE;
+            const auto array_pointer = static_cast<std::uintptr_t>(__readgsqword(0x58));
+            const auto cell_58 = static_cast<std::uintptr_t>(__readgsqword(0x58 + 8 * slot));
+            const auto cell_1480 = static_cast<std::uintptr_t>(__readgsqword(0x1480 + 8 * slot));
+            const auto cell_1780 = static_cast<std::uintptr_t>(__readgsqword(0x1780 + 8 * slot));
+            const auto via_tls_get = reinterpret_cast<std::uintptr_t>(TlsGetValue(slot));
+            std::printf("[rt] TEB check: slot %lu marker %p; TlsGetValue %p; gs:[58] %p; gs:[58+8*slot] %p; "
+                        "gs:[1480+8*slot] %p; gs:[1780+8*slot] %p\n",
+                        static_cast<unsigned long>(slot), marker, reinterpret_cast<void*>(via_tls_get),
+                        reinterpret_cast<void*>(array_pointer), reinterpret_cast<void*>(cell_58),
+                        reinterpret_cast<void*>(cell_1480), reinterpret_cast<void*>(cell_1780));
+            if (slot != TLS_OUT_OF_INDEXES) TlsFree(slot);
+        }
+        // LEONIDA_DUMP_BYTES=<hex rva>[,<hex rva>...]: print words of the mapped image at those RVAs, after the loader
+        // has patched it. This is the only way to see what the guest will actually execute: the file on disk still holds
+        // the unpatched instruction.
+        if (const DWORD size = GetEnvironmentVariableW(L"LEONIDA_DUMP_BYTES", nullptr, 0); size > 1) {
+            std::wstring value(size, L'\0');
+            const DWORD n = GetEnvironmentVariableW(L"LEONIDA_DUMP_BYTES", value.data(), size);
+            if (n > 0 && n < size) value.resize(n);
+            size_t start = 0;
+            while (start <= value.size()) {
+                const size_t comma = value.find(L',', start);
+                const std::wstring piece =
+                    value.substr(start, comma == std::wstring::npos ? std::wstring::npos : comma - start);
+                if (!piece.empty()) {
+                    const auto rva = std::wcstoull(piece.c_str(), nullptr, 16);
+                    const auto* at = reinterpret_cast<const std::uint8_t*>(main_module.base + rva);
+                    std::printf("[rt] bytes at image+0x%llx:", static_cast<unsigned long long>(rva));
+                    for (int i = 0; i < 32; ++i) std::printf(" %02x", at[i]);
+                    std::printf("\n");
+                }
+                if (comma == std::wstring::npos) break;
+                start = comma + 1;
+            }
+            std::fflush(stdout);
         }
         std::printf("running %s\n", main_module.name.c_str());
         std::fflush(stdout);
