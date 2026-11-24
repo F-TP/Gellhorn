@@ -242,6 +242,30 @@ inline void log_exception(const EXCEPTION_POINTERS& info) {
 // clzero / add rax,0x40 / cmp / jb zeroing a structure at startup). Emulate exactly that when the host raises
 // STATUS_ILLEGAL_INSTRUCTION, and report anything else once so an unexpected opcode is visible rather than silently
 // skipped.
+// A poke that must fire on every pass: when the int3 is hit the original byte is restored, the thread is set to
+// single-step that instruction, and the int3 is written back on the step. Without this a probe only ever sees the first
+// pass, which is useless when the interesting pass is a later one.
+inline std::uintptr_t& repoke_address() {
+    static thread_local std::uintptr_t address = 0;
+    return address;
+}
+
+inline bool handle_repoke(EXCEPTION_POINTERS* info) {
+    if (!info->ExceptionRecord || !info->ContextRecord) return false;
+    if (info->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP) return false;
+    const std::uintptr_t address = repoke_address();
+    if (!address) return false;
+    CONTEXT& c = *info->ContextRecord;
+    c.EFlags &= ~static_cast<DWORD>(0x100);
+    DWORD old = 0;
+    if (VirtualProtect(reinterpret_cast<void*>(address), 1, PAGE_EXECUTE_READWRITE, &old)) {
+        *reinterpret_cast<unsigned char*>(address) = 0xCC;
+        VirtualProtect(reinterpret_cast<void*>(address), 1, old, &old);
+    }
+    repoke_address() = 0;
+    return true;
+}
+
 inline bool emulate_amd_instruction(EXCEPTION_POINTERS* info) {
     if (!info->ExceptionRecord || info->ExceptionRecord->ExceptionCode != STATUS_ILLEGAL_INSTRUCTION ||
         !info->ContextRecord)
@@ -266,10 +290,67 @@ inline bool emulate_amd_instruction(EXCEPTION_POINTERS* info) {
     return false;
 }
 
+// LEONIDA_POKE_LEA=<rva>: a diagnostic for one shaped instruction. The loader writes an int3 over the guest's
+// `lea rbx,[rax+0x12a8]` at that RVA; when it fires the registers are logged and the lea is performed by hand before
+// execution continues, so the guest sees exactly the result it would have computed.
+// LEONIDA_POKE_LOG=<rva>[,<rva>...]: up to four one-shot probes. Each address gets an int3 over its first byte; when it
+// fires the registers are logged, the original byte is restored and the instruction re-executed, so the guest's behaviour
+// is unchanged. This is how a register that is correct at one point and wrong at the next is localised to the call
+// between them, without a debugger.
+inline std::uintptr_t* poke_log_addresses() {
+    static std::uintptr_t addresses[4] = {};
+    return addresses;
+}
+inline unsigned char* poke_log_originals() {
+    static unsigned char originals[4] = {};
+    return originals;
+}
+inline void set_poke_log_addresses(const std::uintptr_t* addresses, const unsigned char* originals, unsigned count) {
+    for (unsigned i = 0; i < 4; ++i) {
+        poke_log_addresses()[i] = i < count ? addresses[i] : 0;
+        poke_log_originals()[i] = i < count ? originals[i] : 0;
+    }
+}
+
+inline std::uintptr_t& poke_lea_address() {
+    static std::uintptr_t address = 0;
+    return address;
+}
+inline void set_poke_lea_address(void* address) { poke_lea_address() = reinterpret_cast<std::uintptr_t>(address); }
+
 inline bool skip_int3(EXCEPTION_POINTERS* info) {
     static const bool skip = GetEnvironmentVariableW(L"LEONIDA_SKIP_INT3", nullptr, 0) != 0;
     if (!skip || info->ExceptionRecord->ExceptionCode != EXCEPTION_BREAKPOINT || !info->ContextRecord) return false;
     const auto* at = static_cast<const unsigned char*>(info->ExceptionRecord->ExceptionAddress);
+    for (unsigned i = 0; i < 4; ++i) {
+        auto* const addresses = poke_log_addresses();
+        if (!addresses[i] || reinterpret_cast<std::uintptr_t>(at) != addresses[i]) continue;
+        CONTEXT& c = *info->ContextRecord;
+        std::fprintf(stderr,
+                     "[rt] poke log %u at %p: rax=%p rbx=%p rcx=%p rdx=%p r8=%p r9=%p rdi=%p rsi=%p r12=%p\n",
+                     i, reinterpret_cast<void*>(c.Rip), reinterpret_cast<void*>(c.Rax),
+                     reinterpret_cast<void*>(c.Rbx), reinterpret_cast<void*>(c.Rcx),
+                     reinterpret_cast<void*>(c.Rdx), reinterpret_cast<void*>(c.R8), reinterpret_cast<void*>(c.R9),
+                     reinterpret_cast<void*>(c.Rdi), reinterpret_cast<void*>(c.Rsi),
+                     reinterpret_cast<void*>(c.R12));
+        auto* const originals = poke_log_originals();
+        DWORD old_protect = 0;
+        if (VirtualProtect(reinterpret_cast<void*>(addresses[i]), 1, PAGE_EXECUTE_READWRITE, &old_protect)) {
+            *reinterpret_cast<unsigned char*>(addresses[i]) = originals[i];
+            VirtualProtect(reinterpret_cast<void*>(addresses[i]), 1, old_protect, &old_protect);
+        }
+        repoke_address() = addresses[i];   // re-armed once this instruction has executed
+        c.EFlags |= 0x100;                 // trap after the restored instruction
+        return true;
+    }
+    if (poke_lea_address() && reinterpret_cast<std::uintptr_t>(at) == poke_lea_address()) {
+        CONTEXT& c = *info->ContextRecord;
+        std::fprintf(stderr, "[rt] poke: lea site hit: rax=%p rbx=%p (rbx := rax + 0x12a8)\n",
+                     reinterpret_cast<void*>(c.Rax), reinterpret_cast<void*>(c.Rbx));
+        c.Rbx = c.Rax + 0x12A8;
+        c.Rip += 7;   // the patched instruction was seven bytes long
+        return true;
+    }
     if (!at || *at != 0xCC || info->ContextRecord->Rip != reinterpret_cast<DWORD64>(at)) return false;
     static std::mutex m;
     static std::set<const void*> seen;
@@ -284,6 +365,7 @@ inline bool skip_int3(EXCEPTION_POINTERS* info) {
 }
 
 inline LONG CALLBACK handler(EXCEPTION_POINTERS* info) {
+    if (handle_repoke(info)) return EXCEPTION_CONTINUE_EXECUTION;
     if (emulate_amd_instruction(info)) return EXCEPTION_CONTINUE_EXECUTION;
     if (!enabled() || in_handler || !info || !info->ExceptionRecord) return EXCEPTION_CONTINUE_SEARCH;
     if (skip_int3(info)) return EXCEPTION_CONTINUE_EXECUTION;
@@ -304,7 +386,15 @@ inline LONG CALLBACK handler(EXCEPTION_POINTERS* info) {
     in_handler = false;
     return EXCEPTION_CONTINUE_SEARCH;
 }
-}  // namespace detail
+}
+
+// Public entry point for the poke diagnostic (the machinery lives in detail).
+inline void set_poke_lea_address(void* address) { detail::set_poke_lea_address(address); }
+
+// Public entry point for the poke-log diagnostic (the machinery lives in detail).
+inline void set_poke_log(const std::uintptr_t* addresses, const unsigned char* originals, unsigned count) {
+    detail::set_poke_log_addresses(addresses, originals, count);
+}
 
 inline void close();
 

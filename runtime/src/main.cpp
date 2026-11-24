@@ -348,6 +348,53 @@ int wmain(int argc, wchar_t** argv) {
             }
             std::fflush(stdout);
         }
+        if (const DWORD size = GetEnvironmentVariableW(L"LEONIDA_POKE_LEA", nullptr, 0); size > 1) {
+            std::wstring value(size, L'\0');
+            const DWORD n = GetEnvironmentVariableW(L"LEONIDA_POKE_LEA", value.data(), size);
+            if (n > 0 && n < size) value.resize(n);
+            const auto rva = std::wcstoull(value.c_str(), nullptr, 16);
+            auto* const at = main_module.base + rva;
+            DWORD old = 0;
+            if (VirtualProtect(at, 7, PAGE_EXECUTE_READWRITE, &old)) {
+                at[0] = 0xCC;
+                for (int i = 1; i < 7; ++i) at[i] = 0x90;
+                VirtualProtect(at, 7, old, &old);
+                rt::startup_trace::set_poke_lea_address(at);
+                std::printf("[rt] poked an int3 over the lea at image+0x%llx\n", static_cast<unsigned long long>(rva));
+            }
+        }
+        if (const DWORD size = GetEnvironmentVariableW(L"LEONIDA_POKE_LOG", nullptr, 0); size > 1) {
+            std::wstring value(size, L'\0');
+            const DWORD n = GetEnvironmentVariableW(L"LEONIDA_POKE_LOG", value.data(), size);
+            if (n > 0 && n < size) value.resize(n);
+            std::uintptr_t addresses[4] = {};
+            unsigned char originals[4] = {};
+            unsigned count = 0;
+            size_t start = 0;
+            while (start <= value.size() && count < 4) {
+                const size_t comma = value.find(L',', start);
+                const std::wstring piece =
+                    value.substr(start, comma == std::wstring::npos ? std::wstring::npos : comma - start);
+                if (!piece.empty()) {
+                    const auto rva = std::wcstoull(piece.c_str(), nullptr, 16);
+                    auto* const at = main_module.base + rva;
+                    DWORD old = 0;
+                    if (VirtualProtect(at, 1, PAGE_EXECUTE_READWRITE, &old)) {
+                        originals[count] = *at;
+                        *at = 0xCC;
+                        VirtualProtect(at, 1, old, &old);
+                        addresses[count] = reinterpret_cast<std::uintptr_t>(at);
+                        ++count;
+                        std::printf("[rt] poked a register log at image+0x%llx\n",
+                                    static_cast<unsigned long long>(rva));
+                    }
+                }
+                if (comma == std::wstring::npos) break;
+                start = comma + 1;
+            }
+            rt::startup_trace::set_poke_log(addresses, originals, count);
+            std::fflush(stdout);
+        }
         std::printf("running %s\n", main_module.name.c_str());
         std::fflush(stdout);
         // LEONIDA_WATCH_GLOBAL=<hex rva> logs every change of a mapped image's 8-byte global with the millisecond it
